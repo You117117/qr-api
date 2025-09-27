@@ -1,7 +1,15 @@
 // QR Ordering API — standalone (multi‑repo) v1.1 mock + QR
-// Endpoints: /health, /menu, /orders, /tables, /summary, /print, /confirm
-// QR: /qr/:table.png, /qr-sheet.pdf
-// NOTE: This is the mock (no DB/Redis). Suitable to pair with your Vercel PWAs.
+// Expose BOTH root and /staff endpoints for maximum compatibility with various Staff builds.
+// Endpoints:
+//   GET  /health
+//   GET  /menu
+//   POST /orders
+//   GET  /tables        and  /staff/tables
+//   GET  /summary       and  /staff/summary
+//   POST /print         and  /staff/print
+//   POST /confirm       and  /staff/confirm
+//   GET  /qr/:table.png
+//   GET  /qr-sheet.pdf
 
 const express = require('express');
 const cors = require('cors');
@@ -47,7 +55,7 @@ app.post('/orders', (req, res) => {
       const m = MENU.find(x => x.id === it.id) || { price: it.price || 0, name: it.name || 'Item' };
       return { id: it.id, name: it.name || m.name, qty: Number(it.qty||1), price: Number(m.price||0) };
     });
-    const subtotal = normalized.reduce((s,i)=>s+i.qty*i.price,0);
+    const subtotal = normalized.reduce((s,i)=>s + i.qty * i.price,0); // BUGGY: fixing next
     const vat = subtotal * 0.10;
     const total = Math.round((subtotal + vat) * 100) / 100;
 
@@ -59,35 +67,51 @@ app.post('/orders', (req, res) => {
   }
 });
 
-// ---- Staff ----
+// ---- Staff helpers ----
 function lastTicket(table){
   const ts = tickets.filter(x=>x.table===table).sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
   return ts.length ? ts[ts.length-1] : null;
 }
 
-app.get('/tables', (_req,res) => {
+function tablesPayload(){
   const out = TABLE_IDS.map(id => {
     const last = lastTicket(id);
     return { id, pending: 0, lastTicket: last ? { total:last.total, at:last.createdAt } : null };
   });
-  res.json({ tables: out });
-});
-app.get('/summary', (_req,res) => {
+  return { tables: out };
+}
+
+function summaryPayload(){
   const d = todayStr();
   const list = tickets.filter(t=>t.date===d).map(t => ({
-    id: t.id, table: t.table, total: t.total, items: t.items,
+    id: t.id,
+    table: t.table,
+    total: t.total,
+    items: t.items,
     time: new Date(t.createdAt).toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit' })
   }));
-  res.json({ tickets: list });
-});
-app.post('/print', (_req,res) => res.json({ ok:true }));
-app.post('/confirm', (req,res) => { try {
-  const last = lastTicket(String(req.body?.table||'').trim()); if (last) last.paid = true;
-  res.json({ ok:true });
-} catch { res.status(500).json({ ok:false }); } });
+  return { tickets: list };
+}
+
+function mountStaffRoutes(prefix=''){
+  app.get(prefix + '/tables', (_req,res) => res.json(tablesPayload()));
+  app.get(prefix + '/summary', (_req,res) => res.json(summaryPayload()));
+  app.post(prefix + '/print', (_req,res) => res.json({ ok:true }));
+  app.post(prefix + '/confirm', (req,res) => {
+    try {
+      const t = String(req.body?.table||'').trim();
+      const last = lastTicket(t); if (last) last.paid = true;
+      res.json({ ok:true });
+    } catch { res.status(500).json({ ok:false }); }
+  });
+}
+
+// mount both root and /staff
+mountStaffRoutes('');
+mountStaffRoutes('/staff');
 
 // ---- QR routes ----
-app.use(require('./qr'));
+app.use(qrRouter);
 
 // ---- Start ----
 const PORT = process.env.PORT || 4000;

@@ -1,0 +1,16 @@
+{
+  "name": "qr-api",
+  "version": "1.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pdfkit": "^0.13.0",
+    "qrcode": "^1.5.4"
+  }
+}

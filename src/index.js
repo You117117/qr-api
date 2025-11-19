@@ -203,20 +203,28 @@ function tablesPayload() {
   const raw = TABLE_IDS.map((id) => {
     const last = lastTicketForTable(id, businessDay);
     const status = computeStatusFromTicket(last, now);
-    const lastTicketAt = last ? last.createdAt : null;
+    let lastTicketAt = last ? last.createdAt : null;
+    let lastTicket = last
+      ? {
+          total: last.total,
+          at: last.createdAt,
+        }
+      : null;
+
     const pending = status === STATUS.EMPTY ? 0 : 1;
+
+    // Si la table est revenue à "Vide" après paiement, on ne remonte plus le dernier ticket
+    if (status === STATUS.EMPTY && last && last.paidAt) {
+      lastTicketAt = null;
+      lastTicket = null;
+    }
 
     return {
       id,
       pending,
       status,
       lastTicketAt,
-      lastTicket: last
-        ? {
-            total: last.total,
-            at: last.createdAt,
-          }
-        : null,
+      lastTicket,
     };
   });
 
@@ -229,8 +237,8 @@ function tablesPayload() {
     if (aHas && !bHas) return -1;
     if (!aHas && bHas) return 1;
     if (!aHas && !bHas) {
-      const aNum = parseInt(a.id.replace(/\\D/g, ''), 10);
-      const bNum = parseInt(b.id.replace(/\\D/g, ''), 10);
+      const aNum = parseInt(a.id.replace(/\D/g, ''), 10);
+      const bNum = parseInt(b.id.replace(/\D/g, ''), 10);
       if (!isNaN(aNum) && !isNaN(bNum)) return aNum - bNum;
       return a.id.localeCompare(b.id);
     }
@@ -322,6 +330,26 @@ function mountStaffRoutes(prefix = '') {
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /confirm error', err);
+      res.status(500).json({ ok: false, error: 'internal_error' });
+    }
+  });
+
+  // POST cancel-confirm (annuler paiement)
+  app.post(prefix + '/cancel-confirm', (req, res) => {
+    try {
+      const table = String(req.body?.table || '').trim();
+      if (!table) return res.json({ ok: true });
+
+      const businessDay = getBusinessDayKey();
+      const last = lastTicketForTable(table, businessDay);
+      if (last) {
+        last.paidAt = null;
+        last.paid = false;
+      }
+
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('POST /cancel-confirm error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
     }
   });

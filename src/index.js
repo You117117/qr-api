@@ -44,6 +44,10 @@ const MENU = [
 let tickets = [];
 let seqId = 1;
 
+// ---- État des tables (clôture manuelle) ----
+// Exemple : tableState["T6"] = { closedManually: true }
+const tableState = {};
+
 // ---- Helpers temporels ----
 
 const nowIso = () => new Date().toISOString();
@@ -203,21 +207,29 @@ function tablesPayload() {
   const raw = TABLE_IDS.map((id) => {
     const last = lastTicketForTable(id, businessDay);
     const status = computeStatusFromTicket(last, now);
+
     let lastTicketAt = last ? last.createdAt : null;
     let lastTicket = last
-      ? {
-          total: last.total,
-          at: last.createdAt,
-        }
+      ? { total: last.total, at: last.createdAt }
       : null;
 
-    const pending = status === STATUS.EMPTY ? 0 : 1;
+    const flags = tableState[id] || { closedManually: false };
 
-    // Si la table est revenue à "Vide" après paiement, on ne remonte plus le dernier ticket
-    if (status === STATUS.EMPTY && last && last.paidAt) {
+    // Auto-clear après paiement : table Vide + dernier ticket payé
+    const autoCleared = !!(
+      status === STATUS.EMPTY &&
+      last &&
+      last.paidAt
+    );
+
+    const cleared = !!(flags.closedManually || autoCleared);
+
+    if (cleared) {
       lastTicketAt = null;
       lastTicket = null;
     }
+
+    const pending = status === STATUS.EMPTY ? 0 : 1;
 
     return {
       id,
@@ -225,6 +237,8 @@ function tablesPayload() {
       status,
       lastTicketAt,
       lastTicket,
+      cleared,
+      closedManually: !!flags.closedManually,
     };
   });
 
@@ -313,7 +327,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST confirm
+  // POST confirm (paiement confirmé)
   app.post(prefix + '/confirm', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();
@@ -350,6 +364,42 @@ function mountStaffRoutes(prefix = '') {
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /cancel-confirm error', err);
+      res.status(500).json({ ok: false, error: 'internal_error' });
+    }
+  });
+
+  // POST close-table (clôturer la table manuellement)
+  app.post(prefix + '/close-table', (req, res) => {
+    try {
+      const table = String(req.body?.table || '').trim();
+      if (!table) return res.json({ ok: true });
+
+      if (!tableState[table]) {
+        tableState[table] = { closedManually: false };
+      }
+      tableState[table].closedManually = true;
+
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('POST /close-table error', err);
+      res.status(500).json({ ok: false, error: 'internal_error' });
+    }
+  });
+
+  // POST cancel-close (annuler clôture manuelle)
+  app.post(prefix + '/cancel-close', (req, res) => {
+    try {
+      const table = String(req.body?.table || '').trim();
+      if (!table) return res.json({ ok: true });
+
+      if (!tableState[table]) {
+        tableState[table] = { closedManually: false };
+      }
+      tableState[table].closedManually = false;
+
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('POST /cancel-close error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
     }
   });

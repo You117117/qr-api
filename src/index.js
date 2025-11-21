@@ -125,6 +125,16 @@ app.post('/orders', (req, res) => {
 
     tickets.push(ticket);
 
+    // 🔴 IMPORTANT :
+    // Dès qu'une nouvelle commande arrive sur une table,
+    // on considère que la table est ré-ouverte
+    // → on enlève la clôture manuelle éventuelle.
+    if (!tableState[t]) {
+      tableState[t] = { closedManually: false };
+    } else {
+      tableState[t].closedManually = false;
+    }
+
     res.json({ ok: true, ticket });
   } catch (err) {
     console.error('POST /orders error', err);
@@ -394,7 +404,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST cancel-close (annuler clôture manuelle) — reste dispo si besoin plus tard
+  // POST cancel-close (annuler clôture manuelle) — dispo si besoin plus tard
   app.post(prefix + '/cancel-close', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();

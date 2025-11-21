@@ -17,7 +17,8 @@ const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 // Durées (en millisecondes)
 const BUFFER_MS = 120 * 1000;      // 120s avant que la commande soit considérée "imprimée" automatiquement
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
-const PAY_CLEAR_MS = 30 * 1000;    // 30s d'affichage "Payée" avant retour à "Vide"
+// 🔴 Après Paiement confirmé : 5s "Payée" puis Vide (auto-clôture)
+const PAY_CLEAR_MS = 5 * 1000;
 const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
 const STATUS = {
@@ -312,7 +313,7 @@ function summaryPayload() {
         hour: '2-digit',
         minute: '2-digit',
       }),
-      createdAt: t.createdAt, // 🔴 important pour filtrer par session côté front
+      createdAt: t.createdAt,
     }));
 
   return { tickets: list };
@@ -411,7 +412,7 @@ function mountStaffRoutes(prefix = '') {
         tableState[table] = { closedManually: false, sessionStartAt: null };
       }
       tableState[table].closedManually = true;
-      tableState[table].sessionStartAt = null; // 🔴 fin de session
+      tableState[table].sessionStartAt = null;
 
       res.json({ ok: true });
     } catch (err) {
@@ -420,7 +421,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST cancel-close (annuler clôture manuelle) — dispo si besoin plus tard
+  // POST cancel-close (annuler clôture manuelle)
   app.post(prefix + '/cancel-close', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();
@@ -430,7 +431,7 @@ function mountStaffRoutes(prefix = '') {
         tableState[table] = { closedManually: false, sessionStartAt: null };
       }
       tableState[table].closedManually = false;
-      // on ne remet pas sessionStartAt automatiquement ici
+
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /cancel-close error', err);

@@ -44,8 +44,8 @@ const MENU = [
 let tickets = [];
 let seqId = 1;
 
-// ---- État des tables (clôture manuelle) ----
-// Exemple : tableState["T6"] = { closedManually: true }
+// ---- État des tables (clôture & session) ----
+// Exemple : tableState["T6"] = { closedManually: true, sessionStartAt: "2025-11-21T..." }
 const tableState = {};
 
 // ---- Helpers temporels ----
@@ -110,13 +110,28 @@ app.post('/orders', (req, res) => {
     const total = Math.round((subtotal + vat) * 100) / 100;
 
     const now = new Date();
+    const createdAt = now.toISOString();
+    const businessDay = getBusinessDayKey(now);
+
+    // Initialiser ou mettre à jour l'état de la table
+    if (!tableState[t]) {
+      tableState[t] = { closedManually: false, sessionStartAt: null };
+    }
+
+    // Nouvelle commande = réouverture éventuelle de la table.
+    // Si la session était "reset" (sessionStartAt null), on démarre une NOUVELLE session.
+    tableState[t].closedManually = false;
+    if (!tableState[t].sessionStartAt) {
+      tableState[t].sessionStartAt = createdAt;
+    }
+
     const ticket = {
       id: `TCK${seqId++}`,
       table: t,
       items: normalized,
       total,
-      createdAt: now.toISOString(),
-      date: getBusinessDayKey(now),
+      createdAt,
+      date: businessDay,
       printedAt: null,
       paidAt: null,
       closedAt: null,
@@ -124,16 +139,6 @@ app.post('/orders', (req, res) => {
     };
 
     tickets.push(ticket);
-
-    // 🔴 IMPORTANT :
-    // Dès qu'une nouvelle commande arrive sur une table,
-    // on considère que la table est ré-ouverte
-    // → on enlève la clôture manuelle éventuelle.
-    if (!tableState[t]) {
-      tableState[t] = { closedManually: false };
-    } else {
-      tableState[t].closedManually = false;
-    }
 
     res.json({ ok: true, ticket });
   } catch (err) {
@@ -217,7 +222,7 @@ function tablesPayload() {
   const raw = TABLE_IDS.map((id) => {
     const last = lastTicketForTable(id, businessDay);
     const statusFromTicket = computeStatusFromTicket(last, now);
-    const flags = tableState[id] || { closedManually: false };
+    const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
 
     // Auto-clear après paiement : table Vide + dernier ticket payé
     const autoCleared = !!(
@@ -225,6 +230,14 @@ function tablesPayload() {
       last &&
       last.paidAt
     );
+
+    // Si auto-cleared → on "reset" la sessionStartAt
+    if (autoCleared) {
+      if (!tableState[id]) {
+        tableState[id] = { closedManually: false, sessionStartAt: null };
+      }
+      tableState[id].sessionStartAt = null;
+    }
 
     const cleared = !!(flags.closedManually || autoCleared);
 
@@ -257,6 +270,7 @@ function tablesPayload() {
       lastTicket,
       cleared,
       closedManually: !!flags.closedManually,
+      sessionStartAt: flags.sessionStartAt || null,
     };
   });
 
@@ -298,6 +312,7 @@ function summaryPayload() {
         hour: '2-digit',
         minute: '2-digit',
       }),
+      createdAt: t.createdAt, // 🔴 important pour filtrer par session côté front
     }));
 
   return { tickets: list };
@@ -393,9 +408,10 @@ function mountStaffRoutes(prefix = '') {
       if (!table) return res.json({ ok: true });
 
       if (!tableState[table]) {
-        tableState[table] = { closedManually: false };
+        tableState[table] = { closedManually: false, sessionStartAt: null };
       }
       tableState[table].closedManually = true;
+      tableState[table].sessionStartAt = null; // 🔴 fin de session
 
       res.json({ ok: true });
     } catch (err) {
@@ -411,10 +427,10 @@ function mountStaffRoutes(prefix = '') {
       if (!table) return res.json({ ok: true });
 
       if (!tableState[table]) {
-        tableState[table] = { closedManually: false };
+        tableState[table] = { closedManually: false, sessionStartAt: null };
       }
       tableState[table].closedManually = false;
-
+      // on ne remet pas sessionStartAt automatiquement ici
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /cancel-close error', err);

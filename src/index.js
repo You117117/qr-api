@@ -206,35 +206,43 @@ function tablesPayload() {
 
   const raw = TABLE_IDS.map((id) => {
     const last = lastTicketForTable(id, businessDay);
-    const status = computeStatusFromTicket(last, now);
-
-    let lastTicketAt = last ? last.createdAt : null;
-    let lastTicket = last
-      ? { total: last.total, at: last.createdAt }
-      : null;
-
+    const statusFromTicket = computeStatusFromTicket(last, now);
     const flags = tableState[id] || { closedManually: false };
 
     // Auto-clear après paiement : table Vide + dernier ticket payé
     const autoCleared = !!(
-      status === STATUS.EMPTY &&
+      statusFromTicket === STATUS.EMPTY &&
       last &&
       last.paidAt
     );
 
     const cleared = !!(flags.closedManually || autoCleared);
 
+    // Statut effectif renvoyé au front :
+    // - si clôture manuelle → toujours "Vide"
+    // - sinon ce que donne computeStatusFromTicket
+    let effectiveStatus = statusFromTicket;
+    if (flags.closedManually) {
+      effectiveStatus = STATUS.EMPTY;
+    }
+
+    let lastTicketAt = last ? last.createdAt : null;
+    let lastTicket = last
+      ? { total: last.total, at: last.createdAt }
+      : null;
+
+    // Si la table est "cleared" (auto ou manuelle), on ne remonte plus le dernier ticket
     if (cleared) {
       lastTicketAt = null;
       lastTicket = null;
     }
 
-    const pending = status === STATUS.EMPTY ? 0 : 1;
+    const pending = effectiveStatus === STATUS.EMPTY ? 0 : 1;
 
     return {
       id,
       pending,
-      status,
+      status: effectiveStatus,
       lastTicketAt,
       lastTicket,
       cleared,
@@ -386,7 +394,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST cancel-close (annuler clôture manuelle)
+  // POST cancel-close (annuler clôture manuelle) — reste dispo si besoin plus tard
   app.post(prefix + '/cancel-close', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();

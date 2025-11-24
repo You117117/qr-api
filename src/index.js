@@ -351,7 +351,15 @@ function mountStaffRoutes(prefix = '') {
       const businessDay = getBusinessDayKey();
       const last = lastTicketForTable(table, businessDay);
       if (last) {
-        last.printedAt = nowIso();
+        // ⚠️ On calcule le statut ACTUEL avant de toucher à printedAt
+        const statusNow = computeStatusFromTicket(last, new Date());
+
+        // Si la commande est encore en "Commandée" → ce print démarre vraiment la préparation
+        if (statusNow === STATUS.ORDERED) {
+          last.printedAt = nowIso();
+        }
+        // Si déjà "En préparation" ou "Doit payé" → réimpression simple, on ne change pas le statut
+        // donc on NE TOUCHE PAS à printedAt
       }
 
       res.json({ ok: true });

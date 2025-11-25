@@ -17,6 +17,8 @@ const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 // Durées (en millisecondes)
 const BUFFER_MS = 120 * 1000;      // 120s avant que la commande soit considérée "imprimée" automatiquement
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
+const NEW_ORDER_WINDOW_MS = 3 * 60 * 1000; // 3 min d'affichage pour le statut "Nouvelle commande"
+
 // 🔴 Après Paiement confirmé : 5s "Payée" puis Vide (auto-clôture)
 const PAY_CLEAR_MS = 5 * 1000;
 const RESET_HOUR = 3;              // Changement de journée business à 03:00
@@ -27,6 +29,7 @@ const STATUS = {
   PREP: 'En préparation',
   PAY_DUE: 'Doit payé',
   PAID: 'Payée',
+  NEW_ORDER: 'Nouvelle commande',
 };
 
 // ---- Mock menu ----
@@ -248,6 +251,36 @@ function tablesPayload() {
     let effectiveStatus = statusFromTicket;
     if (flags.closedManually) {
       effectiveStatus = STATUS.EMPTY;
+    }
+
+    // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
+    // sans modifier les timers métiers existants.
+    if (!flags.closedManually && last && !cleared) {
+      const list = ticketsForTable(id, businessDay);
+      if (list.length >= 2) {
+        const prev = list[list.length - 2];
+        const nowTs = now.getTime();
+        const lastCreatedTs = new Date(last.createdAt).getTime();
+        const diffLast = nowTs - lastCreatedTs;
+
+        // Statut "avant" la nouvelle commande (sur le ticket précédent)
+        const prevStatus = computeStatusFromTicket(prev, now);
+
+        // On n'affiche "Nouvelle commande" que si :
+        // - il y a au moins 2 tickets dans la journée pour cette table
+        // - la dernière commande est très récente (< NEW_ORDER_WINDOW_MS)
+        // - la table n'est ni vide ni payée
+        // - et le statut "avant" était déjà en préparation ou doit payé
+        if (
+          diffLast >= 0 &&
+          diffLast < NEW_ORDER_WINDOW_MS &&
+          effectiveStatus !== STATUS.EMPTY &&
+          effectiveStatus !== STATUS.PAID &&
+          (prevStatus === STATUS.PREP || prevStatus === STATUS.PAY_DUE)
+        ) {
+          effectiveStatus = STATUS.NEW_ORDER;
+        }
+      }
     }
 
     let lastTicketAt = last ? last.createdAt : null;

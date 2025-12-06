@@ -9,6 +9,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ---- Session client (démarrage sans commande : prénom validé) ----
+    // Body attendu : { table }
+    app.post('/session/start', (req, res) => {
+      try {
+        const table = String(req.body?.table || '').trim();
+        if (!table) return res.json({ ok: true });
+
+        if (!tableState[table]) {
+          tableState[table] = { closedManually: false, sessionStartAt: null };
+        }
+
+        // Nouvelle session client => on annule éventuellement la clôture manuelle
+        tableState[table].closedManually = false;
+        tableState[table].sessionStartAt = nowIso();
+
+        return res.json({ ok: true });
+      } catch (err) {
+        console.error('POST /session/start error', err);
+        return res.status(500).json({ ok: false, error: 'internal_error' });
+      }
+    });
+
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -29,6 +51,7 @@ const STATUS = {
   PREP: 'En préparation',
   PAY_DUE: 'Doit payé',
   PAID: 'Payée',
+  IN_PROGRESS: 'En cours',
   NEW_ORDER: 'Nouvelle commande',
 };
 
@@ -224,29 +247,34 @@ function tablesPayload() {
   const now = new Date();
 
   const raw = TABLE_IDS.map((id) => {
-    let last = lastTicketForTable(id, businessDay);
-    const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
+  let last = lastTicketForTable(id, businessDay);
+  const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
 
-    // Si une nouvelle session client a démarré après le dernier ticket,
-    // on ignore ce ticket (il appartient à l'ancienne session).
-    if (flags.sessionStartAt && last) {
-      try{
-        const sessTs = new Date(flags.sessionStartAt).getTime();
-        const lastTs = new Date(last.createdAt).getTime();
-        if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs){
-          last = null;
-        }
-      }catch(e){}
-    }
+  // Indique s'il y a une session client active (prénom validé)
+  const hasSession = !!flags.sessionStartAt;
 
-    const statusFromTicket = computeStatusFromTicket(last, now);
+  // Si une nouvelle session client a démarré après le dernier ticket,
+  // on ignore ce ticket (il appartient à l'ancienne session).
+  if (hasSession && last) {
+    try{
+      const sessTs = new Date(flags.sessionStartAt).getTime();
+      const lastTs = new Date(last.createdAt).getTime();
+      if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs){
+        last = null;
+      }
+    }catch(e){}
+  }
 
-    // Auto-clear après paiement : table Vide + dernier ticket payé
-    const autoCleared = !!(
-      statusFromTicket === STATUS.EMPTY &&
-      last &&
-      last.paidAt
-    );
+  const statusFromTicket = computeStatusFromTicket(last, now);
+
+  // Auto-clear après paiement : table Vide + dernier ticket payé,
+  // UNIQUEMENT s'il n'y a PAS de session client en cours.
+  const autoCleared = !!(
+    statusFromTicket === STATUS.EMPTY &&
+    last &&
+    last.paidAt &&
+    !hasSession
+  );
 
     // Si auto-cleared → on "reset" la sessionStartAt
     if (autoCleared) {
@@ -265,6 +293,11 @@ function tablesPayload() {
     if (flags.closedManually) {
       effectiveStatus = STATUS.EMPTY;
     }
+// Si une session client est ouverte et qu'il n'y a pas encore de ticket
+// pour cette session, on considère la table comme "En cours".
+if (!cleared && hasSession && !last) {
+  effectiveStatus = STATUS.IN_PROGRESS;
+}
 
     // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
     // sans modifier les timers métiers existants.

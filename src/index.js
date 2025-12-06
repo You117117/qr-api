@@ -9,33 +9,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-
-// ---- Session client (démarrage sans commande) ----
-app.post('/session/start', (req, res) => {
-  try {
-    const rawTable = (req.body && req.body.table) ? String(req.body.table) : '';
-    const table = rawTable.trim().toUpperCase();
-    if (!table) {
-      return res.json({ ok: true });
-    }
-
-    if (!tableState[table]) {
-      tableState[table] = { closedManually: false, sessionStartAt: null };
-    }
-
-    // Démarre une nouvelle session pour cette table si besoin
-    tableState[table].closedManually = false;
-    if (!tableState[table].sessionStartAt) {
-      tableState[table].sessionStartAt = nowIso();
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('POST /session/start error', err);
-    res.status(500).json({ ok: false, error: 'internal_error' });
-  }
-});
-
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -52,7 +25,6 @@ const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
 const STATUS = {
   EMPTY: 'Vide',
-  IN_PROGRESS: 'En cours',
   ORDERED: 'Commandée',
   PREP: 'En préparation',
   PAY_DUE: 'Doit payé',
@@ -252,20 +224,28 @@ function tablesPayload() {
   const now = new Date();
 
   const raw = TABLE_IDS.map((id) => {
-    const last = lastTicketForTable(id, businessDay);
-    const statusFromTicket = computeStatusFromTicket(last, now);
+    let last = lastTicketForTable(id, businessDay);
     const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
 
-    // Session actuellement ouverte côté client ?
-    const hasSession = !!flags.sessionStartAt;
+    // Si une nouvelle session client a démarré après le dernier ticket,
+    // on ignore ce ticket (il appartient à l'ancienne session).
+    if (flags.sessionStartAt && last) {
+      try{
+        const sessTs = new Date(flags.sessionStartAt).getTime();
+        const lastTs = new Date(last.createdAt).getTime();
+        if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs){
+          last = null;
+        }
+      }catch(e){}
+    }
 
-    // Auto-clear après paiement : table Vide + dernier ticket payé,
-    // UNIQUEMENT s'il n'y a PAS de session client en cours.
+    const statusFromTicket = computeStatusFromTicket(last, now);
+
+    // Auto-clear après paiement : table Vide + dernier ticket payé
     const autoCleared = !!(
       statusFromTicket === STATUS.EMPTY &&
       last &&
-      last.paidAt &&
-      !hasSession
+      last.paidAt
     );
 
     // Si auto-cleared → on "reset" la sessionStartAt
@@ -284,12 +264,6 @@ function tablesPayload() {
     let effectiveStatus = statusFromTicket;
     if (flags.closedManually) {
       effectiveStatus = STATUS.EMPTY;
-    }
-
-    // Si aucune commande du jour mais une session est ouverte côté client,
-    // on renvoie "En cours" pour que le staff voit que la table est occupée.
-    if (!cleared && !last && flags.sessionStartAt) {
-      effectiveStatus = STATUS.IN_PROGRESS;
     }
 
     // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive

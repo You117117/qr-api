@@ -9,6 +9,33 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+
+// ---- Session client (démarrage sans commande) ----
+app.post('/session/start', (req, res) => {
+  try {
+    const rawTable = (req.body && req.body.table) ? String(req.body.table) : '';
+    const table = rawTable.trim().toUpperCase();
+    if (!table) {
+      return res.json({ ok: true });
+    }
+
+    if (!tableState[table]) {
+      tableState[table] = { closedManually: false, sessionStartAt: null };
+    }
+
+    // Démarre une nouvelle session pour cette table si besoin
+    tableState[table].closedManually = false;
+    if (!tableState[table].sessionStartAt) {
+      tableState[table].sessionStartAt = nowIso();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /session/start error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -80,35 +107,7 @@ app.get('/menu', (_req, res) => {
   res.json({ ok: true, items: MENU });
 });
 
-
-// Session côté client : démarrage de session sans commande (prénom saisi)
-app.post('/session/start', (req, res) => {
-  try {
-    const rawTable = req.body && req.body.table ? String(req.body.table).trim() : '';
-    if (!rawTable) {
-      return res.json({ ok: true });
-    }
-    const t = rawTable.toUpperCase();
-
-    if (!tableState[t]) {
-      tableState[t] = { closedManually: false, sessionStartAt: null };
-    }
-
-    // Démarre une session si besoin et ré-ouvre la table si elle était clôturée manuellement
-    tableState[t].closedManually = false;
-    if (!tableState[t].sessionStartAt) {
-      tableState[t].sessionStartAt = nowIso();
-    }
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('POST /session/start error', err);
-    res.status(500).json({ ok: false, error: 'internal_error' });
-  }
-});
-
 // ---- Création de commande : POST /orders ----
-
 // Body attendu : { table, items:[{id, qty}] }
 app.post('/orders', (req, res) => {
   try {
@@ -282,9 +281,9 @@ function tablesPayload() {
       effectiveStatus = STATUS.EMPTY;
     }
 
-    // Si aucune commande du jour mais qu'une session est ouverte et non "cleared",
-    // on considère que la table est "En cours" (clients installés, pas encore de commande).
-    if (!flags.closedManually && !last && flags.sessionStartAt && !cleared) {
+    // Si aucune commande du jour mais une session est ouverte côté client,
+    // on renvoie "En cours" pour que le staff voit que la table est occupée.
+    if (!cleared && !last && flags.sessionStartAt) {
       effectiveStatus = STATUS.IN_PROGRESS;
     }
 

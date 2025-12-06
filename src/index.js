@@ -25,6 +25,7 @@ const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
 const STATUS = {
   EMPTY: 'Vide',
+  IN_PROGRESS: 'En cours',
   ORDERED: 'Commandée',
   PREP: 'En préparation',
   PAY_DUE: 'Doit payé',
@@ -79,7 +80,35 @@ app.get('/menu', (_req, res) => {
   res.json({ ok: true, items: MENU });
 });
 
+
+// Session côté client : démarrage de session sans commande (prénom saisi)
+app.post('/session/start', (req, res) => {
+  try {
+    const rawTable = req.body && req.body.table ? String(req.body.table).trim() : '';
+    if (!rawTable) {
+      return res.json({ ok: true });
+    }
+    const t = rawTable.toUpperCase();
+
+    if (!tableState[t]) {
+      tableState[t] = { closedManually: false, sessionStartAt: null };
+    }
+
+    // Démarre une session si besoin et ré-ouvre la table si elle était clôturée manuellement
+    tableState[t].closedManually = false;
+    if (!tableState[t].sessionStartAt) {
+      tableState[t].sessionStartAt = nowIso();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /session/start error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
 // ---- Création de commande : POST /orders ----
+
 // Body attendu : { table, items:[{id, qty}] }
 app.post('/orders', (req, res) => {
   try {
@@ -251,6 +280,12 @@ function tablesPayload() {
     let effectiveStatus = statusFromTicket;
     if (flags.closedManually) {
       effectiveStatus = STATUS.EMPTY;
+    }
+
+    // Si aucune commande du jour mais qu'une session est ouverte et non "cleared",
+    // on considère que la table est "En cours" (clients installés, pas encore de commande).
+    if (!flags.closedManually && !last && flags.sessionStartAt && !cleared) {
+      effectiveStatus = STATUS.IN_PROGRESS;
     }
 
     // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive

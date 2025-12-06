@@ -9,6 +9,33 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+
+// ---- Session client (démarrage sans commande) ----
+app.post('/session/start', (req, res) => {
+  try {
+    const rawTable = (req.body && req.body.table) ? String(req.body.table) : '';
+    const table = rawTable.trim().toUpperCase();
+    if (!table) {
+      return res.json({ ok: true });
+    }
+
+    if (!tableState[table]) {
+      tableState[table] = { closedManually: false, sessionStartAt: null };
+    }
+
+    // Démarre une nouvelle session pour cette table si besoin
+    tableState[table].closedManually = false;
+    if (!tableState[table].sessionStartAt) {
+      tableState[table].sessionStartAt = nowIso();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /session/start error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -25,11 +52,11 @@ const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
 const STATUS = {
   EMPTY: 'Vide',
+  IN_PROGRESS: 'En cours',
   ORDERED: 'Commandée',
   PREP: 'En préparation',
   PAY_DUE: 'Doit payé',
   PAID: 'Payée',
-  IN_PROGRESS: 'En cours',
   NEW_ORDER: 'Nouvelle commande',
 };
 
@@ -78,32 +105,6 @@ app.get('/health', (_req, res) => {
 
 app.get('/menu', (_req, res) => {
   res.json({ ok: true, items: MENU });
-});
-
-// ---- Début de session client : POST /session/start ----
-// Body attendu : { table }
-app.post('/session/start', (req, res) => {
-  try {
-    const { table } = req.body || {};
-    const t = String(table || '').trim();
-    if (!t) {
-      // Pas de table => on ne casse rien, on répond simplement OK
-      return res.json({ ok: true });
-    }
-
-    if (!tableState[t]) {
-      tableState[t] = { closedManually: false, sessionStartAt: null };
-    }
-
-    // Nouvelle session client = table occupée, on annule la clôture manuelle
-    tableState[t].closedManually = false;
-    tableState[t].sessionStartAt = nowIso();
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error('POST /session/start error', err);
-    return res.status(500).json({ ok: false, error: 'internal_error' });
-  }
 });
 
 // ---- Création de commande : POST /orders ----
@@ -255,11 +256,16 @@ function tablesPayload() {
     const statusFromTicket = computeStatusFromTicket(last, now);
     const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
 
-    // Auto-clear après paiement : table Vide + dernier ticket payé
+    // Session actuellement ouverte côté client ?
+    const hasSession = !!flags.sessionStartAt;
+
+    // Auto-clear après paiement : table Vide + dernier ticket payé,
+    // UNIQUEMENT s'il n'y a PAS de session client en cours.
     const autoCleared = !!(
       statusFromTicket === STATUS.EMPTY &&
       last &&
-      last.paidAt
+      last.paidAt &&
+      !hasSession
     );
 
     // Si auto-cleared → on "reset" la sessionStartAt
@@ -270,7 +276,7 @@ function tablesPayload() {
       tableState[id].sessionStartAt = null;
     }
 
-    const cleared = !!(flags.closedManually || (autoCleared && !flags.sessionStartAt));
+    const cleared = !!(flags.closedManually || autoCleared);
 
     // Statut effectif renvoyé au front :
     // - si clôture manuelle → toujours "Vide"
@@ -279,11 +285,12 @@ function tablesPayload() {
     if (flags.closedManually) {
       effectiveStatus = STATUS.EMPTY;
     }
-// Si une session client est ouverte (sessionStartAt) et que la table n'est pas "cleared",
-// on considère la table comme "En cours" côté staff.
-if (!cleared && flags.sessionStartAt) {
-  effectiveStatus = STATUS.IN_PROGRESS;
-}
+
+    // Si aucune commande du jour mais une session est ouverte côté client,
+    // on renvoie "En cours" pour que le staff voit que la table est occupée.
+    if (!cleared && !last && flags.sessionStartAt) {
+      effectiveStatus = STATUS.IN_PROGRESS;
+    }
 
     // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
     // sans modifier les timers métiers existants.

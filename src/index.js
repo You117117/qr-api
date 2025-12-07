@@ -75,6 +75,87 @@ let seqId = 1;
 // Exemple : tableState["T6"] = { closedManually: true, sessionStartAt: "2025-11-21T..." }
 const tableState = {};
 
+
+// ---- Paniers en mémoire (par table + invité) ----
+// Structure : carts["T6"] = {
+//   guests: {
+//     [guestKey]: {
+//       name: "Younes",
+//       items: {
+//         [cartKey]: { item: { id, name, price }, qty, unitPrice, supplements: [...] }
+//       }
+//     }
+//   }
+// };
+const carts = {};
+
+function buildCartKeyServer(item, supplements) {
+  const base = item && item.id ? String(item.id) : 'item';
+  if (!Array.isArray(supplements) || !supplements.length) return base;
+  const names = supplements
+    .map((s) => (s && (s.name || s.label || s.id || '')) || '')
+    .filter(Boolean)
+    .sort()
+    .join('|');
+  return base + '::' + names;
+}
+
+function ensureGuestCart(table, guestKey, guestName) {
+  if (!carts[table]) {
+    carts[table] = { guests: {} };
+  }
+  if (!carts[table].guests[guestKey]) {
+    carts[table].guests[guestKey] = {
+      name: guestName || '',
+      items: {},
+    };
+  } else if (guestName && !carts[table].guests[guestKey].name) {
+    carts[table].guests[guestKey].name = guestName;
+  }
+  return carts[table].guests[guestKey];
+}
+
+function cartPayloadForTable(table, requestingGuestKey) {
+  const bucket = carts[table];
+  if (!bucket || !bucket.guests) {
+    return { table, items: [], totals: { subtotal: 0, vat: 0, total: 0 } };
+  }
+
+  const items = [];
+  Object.entries(bucket.guests).forEach(([gKey, guest]) => {
+    const gName = guest.name || '';
+    Object.entries(guest.items || {}).forEach(([cartKey, entry]) => {
+      const item = entry.item || {};
+      const unit =
+        typeof entry.unitPrice === 'number'
+          ? entry.unitPrice
+          : Number(item.price || 0);
+      const qty = Number(entry.qty || 0);
+      if (!qty || !item.id) return;
+      items.push({
+        key: cartKey,
+        itemId: item.id,
+        name: item.name || 'Article',
+        price: unit,
+        qty,
+        supplements: entry.supplements || [],
+        guestName: gName,
+        guestKey: gKey,
+        isOwner: requestingGuestKey ? requestingGuestKey === gKey : false,
+      });
+    });
+  });
+
+  const subtotal = items.reduce(
+    (sum, it) => sum + it.qty * (it.price || 0),
+    0
+  );
+  const vat = subtotal * 0.1;
+  const total = Math.round((subtotal + vat) * 100) / 100;
+
+  return { table, items, totals: { subtotal, vat, total } };
+}
+
 // ---- Helpers temporels ----
 
 const nowIso = () => new Date().toISOString();
@@ -97,6 +178,121 @@ function getBusinessDayKey(date = new Date()) {
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
+
+// ---- API Panier (PWA client) ----
+
+// GET /cart?table=T1&guestKey=abc
+app.get('/cart', (req, res) => {
+  try {
+    const table = String(req.query.table || '').trim().toUpperCase();
+    const guestKey = String(req.query.guestKey || '').trim() || null;
+    if (!table) {
+      return res.status(400).json({ ok: false, error: 'missing table' });
+    }
+    const payload = cartPayloadForTable(table, guestKey);
+    return res.json({ ok: true, ...payload });
+  } catch (err) {
+    console.error('GET /cart error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// POST /cart/add
+app.post('/cart/add', (req, res) => {
+  try {
+    const { table, guestKey, guestName, item, qty, supplements, unitPrice } =
+      req.body || {};
+    const t = String(table || '').trim().toUpperCase();
+    const gKey = String(guestKey || '').trim();
+    if (!t || !gKey || !item || !item.id) {
+      return res.status(400).json({ ok: false, error: 'missing fields' });
+    }
+    const safeQty = Number(qty || 0);
+    if (!safeQty) {
+      return res.status(400).json({ ok: false, error: 'invalid qty' });
+    }
+    const supList = Array.isArray(supplements) ? supplements : [];
+    const entryItem = {
+      id: String(item.id),
+      name: item.name || 'Article',
+      price:
+        typeof item.price === 'number'
+          ? item.price
+          : Number(item.price || 0) || 0,
+    };
+    const guestBucket = ensureGuestCart(t, gKey, guestName || '');
+    const key = buildCartKeyServer(entryItem, supList);
+    const current = guestBucket.items[key] || {
+      item: entryItem,
+      qty: 0,
+      unitPrice:
+        typeof unitPrice === 'number'
+          ? unitPrice
+          : Number(unitPrice || entryItem.price || 0),
+      supplements: supList,
+    };
+    current.qty += safeQty;
+    current.unitPrice =
+      typeof unitPrice === 'number'
+        ? unitPrice
+        : Number(unitPrice || current.unitPrice || entryItem.price || 0);
+    current.supplements = supList;
+    guestBucket.items[key] = current;
+
+    const payload = cartPayloadForTable(t, gKey);
+    return res.json({ ok: true, ...payload });
+  } catch (err) {
+    console.error('POST /cart/add error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// POST /cart/update-qty
+app.post('/cart/update-qty', (req, res) => {
+  try {
+    const { table, guestKey, key, delta } = req.body || {};
+    const t = String(table || '').trim().toUpperCase();
+    const gKey = String(guestKey || '').trim();
+    if (!t || !gKey || !key) {
+      return res.status(400).json({ ok: false, error: 'missing fields' });
+    }
+    const bucket = carts[t];
+    if (!bucket || !bucket.guests || !bucket.guests[gKey]) {
+      const payload = cartPayloadForTable(t, gKey);
+      return res.json({ ok: true, ...payload });
+    }
+    const guest = bucket.guests[gKey];
+    const entry = guest.items[key];
+    if (entry) {
+      const d = Number(delta || 0);
+      entry.qty = Number(entry.qty || 0) + d;
+      if (entry.qty <= 0) {
+        delete guest.items[key];
+      }
+    }
+    const payload = cartPayloadForTable(t, gKey);
+    return res.json({ ok: true, ...payload });
+  } catch (err) {
+    console.error('POST /cart/update-qty error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+// POST /cart/clear
+app.post('/cart/clear', (req, res) => {
+  try {
+    const { table } = req.body || {};
+    const t = String(table || '').trim().toUpperCase();
+    if (t && carts[t]) {
+      delete carts[t];
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /cart/clear error', err);
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
 
 app.get('/menu', (_req, res) => {
   res.json({ ok: true, items: MENU });

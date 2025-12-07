@@ -106,7 +106,7 @@ app.get('/menu', (_req, res) => {
 // Body attendu : { table, items:[{id, qty}] }
 app.post('/orders', (req, res) => {
   try {
-    const { table, items } = req.body || {};
+    const { table, items, clientName } = req.body || {};
     const t = String(table || '').trim();
     if (!t) {
       return res.status(400).json({ ok: false, error: 'missing table' });
@@ -115,17 +115,60 @@ app.post('/orders', (req, res) => {
       return res.status(400).json({ ok: false, error: 'empty items' });
     }
 
-    // Normalisation des items par rapport au menu
+    const rootClientName =
+      typeof clientName === 'string' ? clientName.trim() : '';
+
+    // Normalisation des items par rapport au menu + prénom & suppléments
     const normalized = items.map((it) => {
       const menuItem = MENU.find((m) => m.id === it.id) || {
         price: it.price || 0,
         name: it.name || 'Article',
       };
+
+      const qty = Number(it.qty || it.quantity || 1);
+      const price = Number(
+        typeof it.price === 'number' ? it.price : menuItem.price || 0
+      );
+      const name = it.name || menuItem.name;
+
+      // Prénom / nom du client pour cette ligne
+      const lineClientNameRaw =
+        it.clientName ||
+        it.customerName ||
+        it.ownerName ||
+        rootClientName ||
+        '';
+
+      const lineClientName =
+        typeof lineClientNameRaw === 'string'
+          ? lineClientNameRaw.trim()
+          : '';
+
+      // Suppléments / options éventuels
+      let extrasSrc = null;
+      if (Array.isArray(it.extras)) extrasSrc = it.extras;
+      else if (Array.isArray(it.options)) extrasSrc = it.options;
+      else if (Array.isArray(it.supplements)) extrasSrc = it.supplements;
+      else if (Array.isArray(it.toppings)) extrasSrc = it.toppings;
+
+      const extras =
+        Array.isArray(extrasSrc)
+          ? extrasSrc
+              .map((e) =>
+                typeof e === 'string'
+                  ? e.trim()
+                  : (e && (e.label || e.name || e.title || '')).trim()
+              )
+              .filter(Boolean)
+          : [];
+
       return {
         id: it.id,
-        name: it.name || menuItem.name,
-        qty: Number(it.qty || 1),
-        price: Number(menuItem.price || 0),
+        name,
+        qty,
+        price,
+        clientName: lineClientName || undefined,
+        extras: extras.length ? extras : undefined,
       };
     });
 
@@ -152,6 +195,8 @@ app.post('/orders', (req, res) => {
       tableState[t].sessionStartAt = createdAt;
     }
 
+    const ticketClientName = rootClientName || null;
+
     const ticket = {
       id: `TCK${seqId++}`,
       table: t,
@@ -163,6 +208,7 @@ app.post('/orders', (req, res) => {
       paidAt: null,
       closedAt: null,
       paid: false,
+      clientName: ticketClientName,
     };
 
     tickets.push(ticket);
@@ -173,7 +219,6 @@ app.post('/orders', (req, res) => {
     res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
-
 // ---- Helpers Staff ----
 
 function ticketsForTable(table, businessDay) {
@@ -388,6 +433,7 @@ function summaryPayload() {
       table: t.table,
       total: t.total,
       items: t.items,
+      clientName: t.clientName || null,
       time: new Date(t.createdAt).toLocaleTimeString('fr-FR', {
         hour: '2-digit',
         minute: '2-digit',
@@ -397,7 +443,6 @@ function summaryPayload() {
 
   return { tickets: list };
 }
-
 // ---- Montage des routes Staff (root + /staff pour compatibilité) ----
 
 function mountStaffRoutes(prefix = '') {

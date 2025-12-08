@@ -22,9 +22,10 @@ app.use(express.json());
 
         // Nouvelle session client => on annule éventuellement la clôture manuelle
         tableState[table].closedManually = false;
-        tableState[table].sessionStartAt = nowIso();
+        const sessionStartAt = nowIso();
+        tableState[table].sessionStartAt = sessionStartAt;
 
-        return res.json({ ok: true });
+        return res.json({ ok: true, sessionStartAt });
       } catch (err) {
         console.error('POST /session/start error', err);
         return res.status(500).json({ ok: false, error: 'internal_error' });

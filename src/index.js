@@ -22,8 +22,14 @@ app.use(express.json());
 
         // Nouvelle session client => on annule éventuellement la clôture manuelle
         tableState[table].closedManually = false;
-        const sessionStartAt = nowIso();
-        tableState[table].sessionStartAt = sessionStartAt;
+
+        // Si aucune session n'existe encore pour cette table, on en démarre une nouvelle.
+        // Sinon, on réutilise le même timestamp pour que tous les invités partagent la même session.
+        let sessionStartAt = tableState[table].sessionStartAt;
+        if (!sessionStartAt){
+          sessionStartAt = nowIso();
+          tableState[table].sessionStartAt = sessionStartAt;
+        }
 
         return res.json({ ok: true, sessionStartAt });
       } catch (err) {

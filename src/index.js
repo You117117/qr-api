@@ -34,7 +34,9 @@ app.use(express.json());
         console.error('POST /session/start error', err);
         return res.status(500).json({ ok: false, error: 'internal_error' });
       }
-    }
+    });
+
+
 
 // ---- Validation de session client ----
 // GET /session/validate?table=T4&localSessionTs=1733759123456
@@ -63,7 +65,6 @@ app.get('/session/validate', (req, res) => {
       });
     }
 
-    // Assurer une entrée dans tableState
     if (!tableState[table]) {
       tableState[table] = { closedManually: false, sessionStartAt: null };
     }
@@ -116,7 +117,6 @@ app.get('/session/validate', (req, res) => {
 
     // Cas 1 : table clôturée ou aucune session active côté serveur
     if (cleared || !serverSessionTsMs) {
-      // On s'assure de remettre sessionStartAt à null si cleared
       if (cleared) {
         tableState[table].sessionStartAt = null;
       }
@@ -131,21 +131,17 @@ app.get('/session/validate', (req, res) => {
     }
 
     // Cas 2 : session active côté serveur
-    // On compare le timestamp local et serveur
     const TOLERANCE_MS = 30 * 1000; // 30s de tolérance
     let shouldResetClient = false;
     let reason = null;
 
     if (!localSessionTs) {
-      // Le client n'a pas de timestamp local valide → on le force à repartir proprement
       shouldResetClient = true;
       reason = 'MISSING_OR_INVALID_LOCAL_SESSION';
     } else if (localSessionTs + TOLERANCE_MS < serverSessionTsMs) {
-      // Le serveur a une session plus récente que celle du client
       shouldResetClient = true;
       reason = 'NEWER_SESSION_ON_SERVER';
     } else if (localSessionTs - TOLERANCE_MS > serverSessionTsMs) {
-      // Le client semble "en avance" de manière incohérente
       shouldResetClient = true;
       reason = 'LOCAL_SESSION_AHEAD_OF_SERVER';
     }
@@ -163,8 +159,6 @@ app.get('/session/validate', (req, res) => {
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
-);
-
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -556,14 +550,7 @@ app.get('/client/orders', (req, res) => {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
     const table = String(rawTable || '').trim().toUpperCase();
     if (!table) {
-      return res.json({
-        ok: true,
-        table: null,
-        mode: null,
-        clientName: null,
-        orders: [],
-        summary: { items: [], total: 0 }
-      });
+      return res.json({ ok: true, table: null, orders: [], summary: { items: [], total: 0 } });
     }
 
     const businessDay = getBusinessDayKey();
@@ -607,7 +594,6 @@ app.get('/client/orders', (req, res) => {
       })),
     }));
 
-    // Résumé global de la session pour le client
     const grandTotal = orders.reduce((sum, o) => {
       const t = Number(o.total || 0);
       return sum + (Number.isFinite(t) ? t : 0);
@@ -635,8 +621,7 @@ app.get('/client/orders', (req, res) => {
     console.error('GET /client/orders error', err);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
-}););
-// ---- Helpers Staff ----
+});/ ---- Helpers Staff ----
 
 function ticketsForTable(table, businessDay) {
   return tickets

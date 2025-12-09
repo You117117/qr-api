@@ -20,6 +20,7 @@ app.use(express.json());
 // ---- Validation de session côté client : GET /session/validate ----
 // Query params : table=T4&localSessionTs=ISO_OR_TS
 app.get('/session/validate', (req, res) => {
+  console.log('### SESSION_VALIDATE HIT ###', req.query);
   try {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
     const table = String(rawTable || '').trim().toUpperCase();

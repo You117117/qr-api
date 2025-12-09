@@ -34,9 +34,7 @@ app.use(express.json());
         console.error('POST /session/start error', err);
         return res.status(500).json({ ok: false, error: 'internal_error' });
       }
-    });
-
-
+    }
 
 // ---- Validation de session client ----
 // GET /session/validate?table=T4&localSessionTs=1733759123456
@@ -75,8 +73,6 @@ app.get('/session/validate', (req, res) => {
     let last = lastTicketForTable(table, businessDay);
     const hasSession = !!flags.sessionStartAt;
 
-    // Si une nouvelle session client a démarré après le dernier ticket,
-    // on ignore ce ticket (il appartient à l'ancienne session).
     if (hasSession && last) {
       try {
         const sessTs = new Date(flags.sessionStartAt).getTime();
@@ -89,8 +85,6 @@ app.get('/session/validate', (req, res) => {
 
     const statusFromTicket = computeStatusFromTicket(last, now);
 
-    // Auto-clear après paiement : table Vide + dernier ticket payé,
-    // UNIQUEMENT s'il n'y a PAS de session client en cours.
     const autoCleared = !!(
       statusFromTicket === STATUS.EMPTY &&
       last &&
@@ -104,7 +98,6 @@ app.get('/session/validate', (req, res) => {
 
     const cleared = !!(flags.closedManually || autoCleared);
 
-    // Calcul du timestamp de session côté serveur
     let serverSessionTsMs = null;
     if (flags.sessionStartAt) {
       try {
@@ -115,7 +108,6 @@ app.get('/session/validate', (req, res) => {
       } catch (e) {}
     }
 
-    // Cas 1 : table clôturée ou aucune session active côté serveur
     if (cleared || !serverSessionTsMs) {
       if (cleared) {
         tableState[table].sessionStartAt = null;
@@ -130,8 +122,7 @@ app.get('/session/validate', (req, res) => {
       });
     }
 
-    // Cas 2 : session active côté serveur
-    const TOLERANCE_MS = 30 * 1000; // 30s de tolérance
+    const TOLERANCE_MS = 30 * 1000;
     let shouldResetClient = false;
     let reason = null;
 
@@ -158,7 +149,8 @@ app.get('/session/validate', (req, res) => {
     console.error('GET /session/validate error', err);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
-});
+}););
+
 // ---- Constantes métier ----
 
 // Tables physiques disponibles (T1..T10)
@@ -550,7 +542,7 @@ app.get('/client/orders', (req, res) => {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
     const table = String(rawTable || '').trim().toUpperCase();
     if (!table) {
-      return res.json({ ok: true, table: null, orders: [], summary: { items: [], total: 0 } });
+      return res.json({ ok: true, table: null, mode: null, clientName: null, orders: [], summary: { items: [], total: 0 } });
     }
 
     const businessDay = getBusinessDayKey();
@@ -621,7 +613,8 @@ app.get('/client/orders', (req, res) => {
     console.error('GET /client/orders error', err);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
-});/ ---- Helpers Staff ----
+}););
+// ---- Helpers Staff ----
 
 function ticketsForTable(table, businessDay) {
   return tickets

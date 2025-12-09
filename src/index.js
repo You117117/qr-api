@@ -420,6 +420,62 @@ app.post('/orders', (req, res) => {
     res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
+
+// ---- Récupération des commandes côté client : GET /client/orders?table=T4 ----
+app.get('/client/orders', (req, res) => {
+  try {
+    const rawTable = (req.query && (req.query.table || req.query.t)) || '';
+    const table = String(rawTable || '').trim().toUpperCase();
+    if (!table) {
+      return res.json({ ok: true, orders: [] });
+    }
+
+    const businessDay = getBusinessDayKey();
+    let list = ticketsForTable(table, businessDay);
+
+    const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
+    if (flags.sessionStartAt) {
+      try {
+        const sessTs = new Date(flags.sessionStartAt).getTime();
+        if (!Number.isNaN(sessTs)) {
+          list = list.filter((ticket) => {
+            const createdTs = new Date(ticket.createdAt).getTime();
+            return !Number.isNaN(createdTs) && createdTs >= sessTs;
+          });
+        }
+      } catch (e) {}
+    }
+
+    if (!list.length) {
+      return res.json({ ok: true, table, orders: [] });
+    }
+
+    const orders = list.map((ticket) => ({
+      id: ticket.id,
+      ts: new Date(ticket.createdAt).getTime(),
+      total: ticket.total,
+      items: (ticket.items || []).map((it) => ({
+        id: it.id,
+        name: it.name,
+        price: it.price,
+        qty: it.qty,
+        clientName: it.clientName || null,
+        extras: Array.isArray(it.extras) ? it.extras : []
+      })),
+    }));
+
+    return res.json({
+      ok: true,
+      table,
+      mode: null,
+      clientName: null,
+      orders,
+    });
+  } catch (err) {
+    console.error('GET /client/orders error', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
 // ---- Helpers Staff ----
 
 function ticketsForTable(table, businessDay) {

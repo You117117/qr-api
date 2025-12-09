@@ -16,7 +16,106 @@ app.use(express.json());
         const table = String(req.body?.table || '').trim();
         if (!table) return res.json({ ok: true });
 
-        if (!tableState[table]) {
+        
+// ---- Validation de session côté client : GET /session/validate ----
+// Query params : table=T4&localSessionTs=ISO_OR_TS
+app.get('/session/validate', (req, res) => {
+  try {
+    const rawTable = (req.query && (req.query.table || req.query.t)) || '';
+    const table = String(rawTable || '').trim().toUpperCase();
+    const localSessionTsRaw = (req.query && req.query.localSessionTs) || '';
+    const localSessionTs = String(localSessionTsRaw || '').trim() || null;
+
+    if (!table) {
+      return res.json({
+        ok: true,
+        table: null,
+        sessionActive: false,
+        serverSessionTs: null,
+        shouldResetClient: true,
+        reason: 'MISSING_TABLE',
+      });
+    }
+
+    const businessDay = getBusinessDayKey();
+    let last = lastTicketForTable(table, businessDay);
+    const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
+    const hasSession = !!flags.sessionStartAt;
+
+    // Si une nouvelle session client a démarré après le dernier ticket,
+    // on ignore ce ticket (ancienne session).
+    if (hasSession && last) {
+      try {
+        const sessTs = new Date(flags.sessionStartAt).getTime();
+        const lastTs = new Date(last.createdAt).getTime();
+        if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs) {
+          last = null;
+        }
+      } catch (e) {}
+    }
+
+    const now = new Date();
+    const statusFromTicket = computeStatusFromTicket(last, now);
+
+    // Auto-clear après paiement : table Vide + dernier ticket payé,
+    // UNIQUEMENT s'il n'y a PAS de session client en cours.
+    const autoCleared = !!(
+      statusFromTicket === STATUS.EMPTY &&
+      last &&
+      last.paidAt &&
+      !hasSession
+    );
+
+    if (autoCleared) {
+      if (!tableState[table]) {
+        tableState[table] = { closedManually: false, sessionStartAt: null };
+      }
+      tableState[table].sessionStartAt = null;
+    }
+
+    const cleared = !!(flags.closedManually || autoCleared);
+    const sessionActive = !!(hasSession && !cleared);
+    const serverSessionTs = sessionActive ? flags.sessionStartAt : null;
+
+    let shouldResetClient = false;
+    let reason = null;
+
+    if (!sessionActive) {
+      shouldResetClient = true;
+      reason = 'TABLE_CLEARED';
+    } else {
+      // Session active côté backend, on compare les timestamps si dispo.
+      if (!localSessionTs) {
+        shouldResetClient = true;
+        reason = 'MISSING_LOCAL_SESSION';
+      } else {
+        try {
+          const backendTs = new Date(serverSessionTs).getTime();
+          const localTs = new Date(localSessionTs).getTime();
+          if (!Number.isNaN(backendTs) && !Number.isNaN(localTs) && backendTs !== localTs) {
+            shouldResetClient = true;
+            reason = 'NEW_SESSION_ON_SERVER';
+          }
+        } catch (e) {
+          // En cas de doute on ne force pas le reset, le front fera sa vie.
+        }
+      }
+    }
+
+    return res.json({
+      ok: true,
+      table,
+      sessionActive,
+      serverSessionTs,
+      shouldResetClient,
+      reason,
+    });
+  } catch (err) {
+    console.error('GET /session/validate error', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+if (!tableState[table]) {
           tableState[table] = { closedManually: false, sessionStartAt: null };
         }
 
@@ -34,122 +133,7 @@ app.use(express.json());
         console.error('POST /session/start error', err);
         return res.status(500).json({ ok: false, error: 'internal_error' });
       }
-    }
-
-// ---- Validation de session client ----
-// GET /session/validate?table=T4&localSessionTs=1733759123456
-// Le backend décide si le client doit repartir à zéro ou non.
-app.get('/session/validate', (req, res) => {
-  try {
-    const rawTable = (req.query && (req.query.table || req.query.t)) || '';
-    const table = String(rawTable || '').trim().toUpperCase();
-    const rawLocalTs = (req.query && req.query.localSessionTs) || '';
-    let localSessionTs = null;
-    if (rawLocalTs !== undefined && rawLocalTs !== null && String(rawLocalTs).trim() !== '') {
-      const n = Number(String(rawLocalTs).trim());
-      if (Number.isFinite(n) && n > 0) {
-        localSessionTs = n;
-      }
-    }
-
-    if (!table) {
-      return res.json({
-        ok: true,
-        table: null,
-        sessionActive: false,
-        serverSessionTs: null,
-        shouldResetClient: true,
-        reason: 'MISSING_TABLE'
-      });
-    }
-
-    if (!tableState[table]) {
-      tableState[table] = { closedManually: false, sessionStartAt: null };
-    }
-    const flags = tableState[table];
-
-    const businessDay = getBusinessDayKey();
-    const now = new Date();
-    let last = lastTicketForTable(table, businessDay);
-    const hasSession = !!flags.sessionStartAt;
-
-    if (hasSession && last) {
-      try {
-        const sessTs = new Date(flags.sessionStartAt).getTime();
-        const lastTs = new Date(last.createdAt).getTime();
-        if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs) {
-          last = null;
-        }
-      } catch (e) {}
-    }
-
-    const statusFromTicket = computeStatusFromTicket(last, now);
-
-    const autoCleared = !!(
-      statusFromTicket === STATUS.EMPTY &&
-      last &&
-      last.paidAt &&
-      !hasSession
-    );
-
-    if (autoCleared) {
-      tableState[table].sessionStartAt = null;
-    }
-
-    const cleared = !!(flags.closedManually || autoCleared);
-
-    let serverSessionTsMs = null;
-    if (flags.sessionStartAt) {
-      try {
-        const ts = new Date(flags.sessionStartAt).getTime();
-        if (!Number.isNaN(ts)) {
-          serverSessionTsMs = ts;
-        }
-      } catch (e) {}
-    }
-
-    if (cleared || !serverSessionTsMs) {
-      if (cleared) {
-        tableState[table].sessionStartAt = null;
-      }
-      return res.json({
-        ok: true,
-        table,
-        sessionActive: false,
-        serverSessionTs: null,
-        shouldResetClient: true,
-        reason: cleared ? 'TABLE_CLEARED' : 'NO_ACTIVE_SESSION'
-      });
-    }
-
-    const TOLERANCE_MS = 30 * 1000;
-    let shouldResetClient = false;
-    let reason = null;
-
-    if (!localSessionTs) {
-      shouldResetClient = true;
-      reason = 'MISSING_OR_INVALID_LOCAL_SESSION';
-    } else if (localSessionTs + TOLERANCE_MS < serverSessionTsMs) {
-      shouldResetClient = true;
-      reason = 'NEWER_SESSION_ON_SERVER';
-    } else if (localSessionTs - TOLERANCE_MS > serverSessionTsMs) {
-      shouldResetClient = true;
-      reason = 'LOCAL_SESSION_AHEAD_OF_SERVER';
-    }
-
-    return res.json({
-      ok: true,
-      table,
-      sessionActive: true,
-      serverSessionTs: flags.sessionStartAt,
-      shouldResetClient,
-      reason
     });
-  } catch (err) {
-    console.error('GET /session/validate error', err);
-    return res.status(500).json({ ok: false, error: 'internal_error' });
-  }
-}););
 
 // ---- Constantes métier ----
 
@@ -542,7 +526,7 @@ app.get('/client/orders', (req, res) => {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
     const table = String(rawTable || '').trim().toUpperCase();
     if (!table) {
-      return res.json({ ok: true, table: null, mode: null, clientName: null, orders: [], summary: { items: [], total: 0 } });
+      return res.json({ ok: true, orders: [] });
     }
 
     const businessDay = getBusinessDayKey();
@@ -562,14 +546,7 @@ app.get('/client/orders', (req, res) => {
     }
 
     if (!list.length) {
-      return res.json({
-        ok: true,
-        table,
-        mode: null,
-        clientName: null,
-        orders: [],
-        summary: { items: [], total: 0 }
-      });
+      return res.json({ ok: true, table, orders: [] });
     }
 
     const orders = list.map((ticket) => ({
@@ -586,34 +563,18 @@ app.get('/client/orders', (req, res) => {
       })),
     }));
 
-    const grandTotal = orders.reduce((sum, o) => {
-      const t = Number(o.total || 0);
-      return sum + (Number.isFinite(t) ? t : 0);
-    }, 0);
-
-    const mergedItems = orders.reduce((all, o) => {
-      if (Array.isArray(o.items)) {
-        return all.concat(o.items);
-      }
-      return all;
-    }, []);
-
     return res.json({
       ok: true,
       table,
       mode: null,
       clientName: null,
       orders,
-      summary: {
-        items: mergedItems,
-        total: grandTotal
-      }
     });
   } catch (err) {
     console.error('GET /client/orders error', err);
     return res.status(500).json({ ok: false, error: 'internal_error' });
   }
-}););
+});
 // ---- Helpers Staff ----
 
 function ticketsForTable(table, businessDay) {

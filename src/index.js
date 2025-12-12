@@ -533,7 +533,7 @@ app.get('/client/orders', (req, res) => {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
     const table = String(rawTable || '').trim().toUpperCase();
     if (!table) {
-      return res.json({ ok: true, orders: [] });
+      return res.json({ ok: true, table: null, sessionActive: false, sessionStartAt: null, orders: [], mergedItems: [], grandTotal: 0 });
     }
 
     const businessDay = getBusinessDayKey();
@@ -542,7 +542,7 @@ app.get('/client/orders', (req, res) => {
     const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
     // IMPORTANT: if no active sessionStartAt, we must NOT return old tickets from earlier sessions.
     if (!flags.sessionStartAt) {
-      return res.json({ ok: true, table, orders: [], mergedItems: [], grandTotal: 0 });
+      return res.json({ ok: true, table, sessionActive: false, sessionStartAt: null, orders: [], mergedItems: [], grandTotal: 0 });
     }
 
     if (flags.sessionStartAt) {
@@ -558,7 +558,7 @@ app.get('/client/orders', (req, res) => {
     }
 
     if (!list.length) {
-      return res.json({ ok: true, table, orders: [] });
+      return res.json({ ok: true, table, sessionActive: true, sessionStartAt: flags.sessionStartAt, orders: [], mergedItems: [], grandTotal: 0 });
     }
 
     const orders = list.map((ticket) => ({
@@ -592,6 +592,8 @@ app.get('/client/orders', (req, res) => {
     return res.json({
       ok: true,
       table,
+      sessionActive: true,
+      sessionStartAt: flags.sessionStartAt,
       mode: null,
       clientName: null,
       orders,

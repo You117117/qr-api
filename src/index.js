@@ -24,9 +24,16 @@ app.use(express.json());
         tableState[table].closedManually = false;
 
         let sessionStartAt = tableState[table].sessionStartAt;
+        const wasEmpty = !sessionStartAt;
         if (!sessionStartAt) {
           sessionStartAt = nowIso();
           tableState[table].sessionStartAt = sessionStartAt;
+        }
+        // Si on démarre une NOUVELLE session (table réouverte), on repart de zéro côté panier
+        if (wasEmpty) {
+          if (carts[table]) {
+            delete carts[table];
+          }
         }
 
         return res.json({ ok: true, sessionStartAt });
@@ -205,7 +212,13 @@ app.get('/session/validate', (req, res) => {
 
     const businessDay = getBusinessDayKey();
     let last = lastTicketForTable(table, businessDay);
-    const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
+    const flags = tableState\[table\] \|\| \{ closedManually: false, sessionStartAt: null \};
+
+    // Aucune session active => pour le client, on repart de zéro (pas d'anciennes commandes).
+    if (!flags.sessionStartAt) {
+      return res.json({ ok: true, table, orders: [] });
+    }
+
     const hasSession = !!flags.sessionStartAt;
 
     // Si une nouvelle session client a démarré après le dernier ticket,
@@ -237,6 +250,10 @@ app.get('/session/validate', (req, res) => {
         tableState[table] = { closedManually: false, sessionStartAt: null };
       }
       tableState[table].sessionStartAt = null;
+      // Après auto-clear, on purge aussi le panier en mémoire
+      if (carts[table]) {
+        delete carts[table];
+      }
     }
 
     const flagsAfter = tableState[table] || { closedManually: false, sessionStartAt: null };
@@ -700,6 +717,10 @@ function tablesPayload() {
         tableState[id] = { closedManually: false, sessionStartAt: null };
       }
       tableState[id].sessionStartAt = null;
+      // Après auto-clear, on purge aussi le panier en mémoire
+      if (carts[id]) {
+        delete carts[id];
+      }
     }
 
     const cleared = !!(flags.closedManually || autoCleared);
@@ -918,6 +939,10 @@ function mountStaffRoutes(prefix = '') {
       }
       tableState[table].closedManually = true;
       tableState[table].sessionStartAt = null;
+      // Clôture manuelle => on purge le panier en mémoire pour repartir de zéro
+      if (carts[table]) {
+        delete carts[table];
+      }
 
       res.json({ ok: true });
     } catch (err) {

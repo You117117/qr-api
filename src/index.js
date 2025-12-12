@@ -25,12 +25,11 @@ app.use(express.json());
 
         let sessionStartAt = tableState[table].sessionStartAt;
         if (!sessionStartAt) {
-          // Nouvelle session => purge panier serveur pour repartir à zéro
-          delete carts[table];
+          // Nouvelle session => on repart de zéro côté panier partagé
+          try { delete carts[table]; } catch (e) {}
           sessionStartAt = nowIso();
           tableState[table].sessionStartAt = sessionStartAt;
         }
-
 
         return res.json({ ok: true, sessionStartAt });
       } catch (err) {
@@ -437,9 +436,9 @@ app.get('/client/orders', (req, res) => {
     let list = ticketsForTable(table, businessDay);
 
     const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
-    // Si aucune session active côté serveur, on ne renvoie aucune commande (évite les anciennes sessions)
+    // Si aucune session active (table clôturée / pas démarrée), on ne renvoie AUCUNE ancienne commande
     if (!flags.sessionStartAt) {
-      return res.json({ ok: true, table, orders: [], grandTotal: 0, mergedItems: [] });
+      return res.json({ ok: true, table, orders: [] });
     }
 
     if (flags.sessionStartAt) {
@@ -810,9 +809,10 @@ function mountStaffRoutes(prefix = '') {
       }
       tableState[table].closedManually = true;
       tableState[table].sessionStartAt = null;
-      // Purge du panier serveur pour éviter toute fuite sur nouvelle session
-      delete carts[table];
 
+
+      // Clôture => on purge le panier partagé serveur
+      try { delete carts[table]; } catch (e) {}
       res.json({ ok: true });
     } catch (err) {
       console.error('POST /close-table error', err);

@@ -24,17 +24,13 @@ app.use(express.json());
         tableState[table].closedManually = false;
 
         let sessionStartAt = tableState[table].sessionStartAt;
-        const wasEmpty = !sessionStartAt;
         if (!sessionStartAt) {
+          // Nouvelle session => purge panier serveur pour repartir à zéro
+          delete carts[table];
           sessionStartAt = nowIso();
           tableState[table].sessionStartAt = sessionStartAt;
         }
-        // Si on démarre une NOUVELLE session (table réouverte), on repart de zéro côté panier
-        if (wasEmpty) {
-          if (carts[table]) {
-            delete carts[table];
-          }
-        }
+
 
         return res.json({ ok: true, sessionStartAt });
       } catch (err) {
@@ -188,118 +184,8 @@ function getBusinessDayKey(date = new Date()) {
 // ---- Endpoints simples ----
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, v: 'session-validate-v2' });
+  res.json({ ok: true });
 });
-// ---- Validation de session côté client : GET /session/validate ----
-// Query params : table=T4&localSessionTs=ISO_OR_TS
-app.get('/session/validate', (req, res) => {
-  try {
-    const rawTable = (req.query && (req.query.table || req.query.t)) || '';
-    const table = String(rawTable || '').trim().toUpperCase();
-    const localSessionTsRaw = (req.query && req.query.localSessionTs) || '';
-    const localSessionTs = String(localSessionTsRaw || '').trim() || null;
-
-    if (!table) {
-      return res.json({
-        ok: true,
-        table: null,
-        sessionActive: false,
-        serverSessionTs: null,
-        shouldResetClient: true,
-        reason: 'MISSING_TABLE',
-      });
-    }
-
-    const businessDay = getBusinessDayKey();
-    let last = lastTicketForTable(table, businessDay);
-    const flags = tableState\[table\] \|\| \{ closedManually: false, sessionStartAt: null \};
-
-    // Aucune session active => pour le client, on repart de zéro (pas d'anciennes commandes).
-    if (!flags.sessionStartAt) {
-      return res.json({ ok: true, table, orders: [] });
-    }
-
-    const hasSession = !!flags.sessionStartAt;
-
-    // Si une nouvelle session client a démarré après le dernier ticket,
-    // on ignore ce ticket (ancienne session).
-    if (hasSession && last) {
-      try {
-        const sessTs = new Date(flags.sessionStartAt).getTime();
-        const lastTs = new Date(last.createdAt).getTime();
-        if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs) {
-          last = null;
-        }
-      } catch (e) {}
-    }
-
-    const now = new Date();
-    const statusFromTicket = computeStatusFromTicket(last, now);
-
-    // Auto-clear après paiement : table Vide + dernier ticket payé,
-    // UNIQUEMENT s'il n'y a PAS de session client en cours.
-    const autoCleared = !!(
-      statusFromTicket === STATUS.EMPTY &&
-      last &&
-      last.paidAt &&
-      !hasSession
-    );
-
-    if (autoCleared) {
-      if (!tableState[table]) {
-        tableState[table] = { closedManually: false, sessionStartAt: null };
-      }
-      tableState[table].sessionStartAt = null;
-      // Après auto-clear, on purge aussi le panier en mémoire
-      if (carts[table]) {
-        delete carts[table];
-      }
-    }
-
-    const flagsAfter = tableState[table] || { closedManually: false, sessionStartAt: null };
-    const cleared = !!(flagsAfter.closedManually || autoCleared);
-    const sessionActive = !!(flagsAfter.sessionStartAt && !cleared);
-    const serverSessionTs = sessionActive ? flagsAfter.sessionStartAt : null;
-
-    let shouldResetClient = false;
-    let reason = null;
-
-    if (!sessionActive) {
-      shouldResetClient = true;
-      reason = 'TABLE_CLEARED';
-    } else {
-      // Session active côté backend, on compare les timestamps si dispo.
-      if (!localSessionTs) {
-        shouldResetClient = true;
-        reason = 'MISSING_LOCAL_SESSION';
-      } else {
-        try {
-          const backendTs = new Date(serverSessionTs).getTime();
-          const localTs = new Date(localSessionTs).getTime();
-          if (!Number.isNaN(backendTs) && !Number.isNaN(localTs) && backendTs !== localTs) {
-            shouldResetClient = true;
-            reason = 'NEW_SESSION_ON_SERVER';
-          }
-        } catch (e) {
-          // En cas de doute on ne force pas le reset, le front fera sa vie.
-        }
-      }
-    }
-
-    return res.json({
-      ok: true,
-      table,
-      sessionActive,
-      serverSessionTs,
-      shouldResetClient,
-      reason,
-    });
-  } catch (err) {
-    console.error('GET /session/validate error', err);
-    return res.status(500).json({ ok: false, error: 'internal_error' });
-  }
-});
-
 
 // ---- API Panier (PWA client) ----
 
@@ -551,6 +437,11 @@ app.get('/client/orders', (req, res) => {
     let list = ticketsForTable(table, businessDay);
 
     const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
+    // Si aucune session active côté serveur, on ne renvoie aucune commande (évite les anciennes sessions)
+    if (!flags.sessionStartAt) {
+      return res.json({ ok: true, table, orders: [], grandTotal: 0, mergedItems: [] });
+    }
+
     if (flags.sessionStartAt) {
       try {
         const sessTs = new Date(flags.sessionStartAt).getTime();
@@ -577,23 +468,9 @@ app.get('/client/orders', (req, res) => {
         price: it.price,
         qty: it.qty,
         clientName: it.clientName || null,
-        extras: Array.isArray(it.extras) ? it.extras : [],
+        extras: Array.isArray(it.extras) ? it.extras : []
       })),
     }));
-
-    const grandTotal = orders.reduce((sum, o) => sum + Number(o.total || 0), 0);
-    const mergedItems = orders.reduce((all, o) => {
-      if (Array.isArray(o.items)) {
-        return all.concat(
-          o.items.map((it) => ({
-            ...it,
-            orderId: o.id,
-            ts: o.ts,
-          }))
-        );
-      }
-      return all;
-    }, []);
 
     return res.json({
       ok: true,
@@ -601,8 +478,6 @@ app.get('/client/orders', (req, res) => {
       mode: null,
       clientName: null,
       orders,
-      grandTotal,
-      mergedItems,
     });
   } catch (err) {
     console.error('GET /client/orders error', err);
@@ -717,10 +592,6 @@ function tablesPayload() {
         tableState[id] = { closedManually: false, sessionStartAt: null };
       }
       tableState[id].sessionStartAt = null;
-      // Après auto-clear, on purge aussi le panier en mémoire
-      if (carts[id]) {
-        delete carts[id];
-      }
     }
 
     const cleared = !!(flags.closedManually || autoCleared);
@@ -939,10 +810,8 @@ function mountStaffRoutes(prefix = '') {
       }
       tableState[table].closedManually = true;
       tableState[table].sessionStartAt = null;
-      // Clôture manuelle => on purge le panier en mémoire pour repartir de zéro
-      if (carts[table]) {
-        delete carts[table];
-      }
+      // Purge du panier serveur pour éviter toute fuite sur nouvelle session
+      delete carts[table];
 
       res.json({ ok: true });
     } catch (err) {

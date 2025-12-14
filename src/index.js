@@ -42,7 +42,7 @@ app.use(express.json());
 const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 
 // Durées (en millisecondes)
-const BUFFER_MS = 120 * 1000;      // 120s avant que la commande soit considérée "imprimée" automatiquement
+const ORDER_TO_PREP_MS = 120 * 1000; // délai d'affichage "Commandée" avant "En préparation" (impression cuisine immédiate)
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
 const NEW_ORDER_WINDOW_MS = 3 * 60 * 1000; // 3 min d'affichage pour le statut "Nouvelle commande"
 
@@ -511,7 +511,7 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
-      printedAt: null,
+      printedAt: nowIso(),
       paidAt: null,
       closedAt: null,
       paid: false,
@@ -633,9 +633,6 @@ function computeStatusFromTicket(ticket, now = new Date()) {
 
   const nowTs = now.getTime();
   const createdTs = new Date(ticket.createdAt).getTime();
-  const printedTs = ticket.printedAt
-    ? new Date(ticket.printedAt).getTime()
-    : null;
   const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
 
   // 1) Paiement : Payée pendant PAY_CLEAR_MS, puis Vide
@@ -647,29 +644,23 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.EMPTY;
   }
 
-  // 2) Déterminer "effectivement imprimé" :
-  // - soit imprimé manuellement (printedAt)
-  // - soit buffer de 120s expiré
-  let effectivePrintedTs = printedTs;
-  if (!effectivePrintedTs) {
-    const diffSinceCreate = nowTs - createdTs;
-    if (diffSinceCreate >= BUFFER_MS) {
-      effectivePrintedTs = createdTs + BUFFER_MS;
-    }
-  }
+  // 2) Timeline de statut (impression cuisine immédiate)
+  // On garde l'affichage "Commandée" un court délai, puis on passe en préparation automatiquement.
+  const orderToPrepAt = createdTs + ORDER_TO_PREP_MS;
 
-  // Si pas encore "imprimé" (ni auto, ni manuel) → Commandée
-  if (!effectivePrintedTs) {
+  // Tant qu'on est avant orderToPrepAt → Commandée
+  if (nowTs < orderToPrepAt) {
     return STATUS.ORDERED;
   }
 
-  // 3) Imprimé mais pas payé : En préparation puis Doit payé
-  const diffPrep = nowTs - effectivePrintedTs;
+  // 3) Pas payé : En préparation puis Doit payer
+  const diffPrep = nowTs - orderToPrepAt;
   if (diffPrep < PREP_MS) {
     return STATUS.PREP;
   }
   return STATUS.PAY_DUE;
 }
+
 
 // ---- Payload /tables ----
 
@@ -753,7 +744,7 @@ if (!cleared && hasSession && !last) {
           diffLast < NEW_ORDER_WINDOW_MS &&
           effectiveStatus !== STATUS.EMPTY &&
           effectiveStatus !== STATUS.PAID &&
-          (prevStatus === STATUS.PREP || prevStatus === STATUS.PAY_DUE)
+          (prevStatus === STATUS.ORDERED || prevStatus === STATUS.PREP || prevStatus === STATUS.PAY_DUE)
         ) {
           effectiveStatus = STATUS.NEW_ORDER;
         }
@@ -861,15 +852,9 @@ function mountStaffRoutes(prefix = '') {
       const businessDay = getBusinessDayKey();
       const last = lastTicketForTable(table, businessDay);
       if (last) {
-        // ⚠️ On calcule le statut ACTUEL avant de toucher à printedAt
-        const statusNow = computeStatusFromTicket(last, new Date());
-
-        // Si la commande est encore en "Commandée" → ce print démarre vraiment la préparation
-        if (statusNow === STATUS.ORDERED) {
-          last.printedAt = nowIso();
-        }
-        // Si déjà "En préparation" ou "Doit payé" → réimpression simple, on ne change pas le statut
-        // donc on NE TOUCHE PAS à printedAt
+        // Impression cuisine = immédiate à la création du ticket.
+        // Ce endpoint sert uniquement à déclencher une réimpression (reprint) côté matériel.
+        // On ne modifie AUCUN timestamp ici pour ne pas casser la timeline des statuts.
       }
 
       res.json({ ok: true });

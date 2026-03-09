@@ -756,7 +756,23 @@ if (!cleared && hasSession && !last) {
     // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
     // sans modifier les timers métiers existants.
     if (!flags.closedManually && last && !cleared) {
-      const list = ticketsForTable(id, businessDay);
+      let list = ticketsForTable(id, businessDay);
+
+      // IMPORTANT: "Nouvelle commande" must be evaluated only inside the CURRENT session.
+      // After a manual close/reset, old tickets from earlier sessions of the same day
+      // must not make the first ticket of the new session look like an additional order.
+      if (flags.sessionStartAt) {
+        try {
+          const sessTs = new Date(flags.sessionStartAt).getTime();
+          if (!Number.isNaN(sessTs)) {
+            list = list.filter((ticket) => {
+              const createdTs = new Date(ticket.createdAt).getTime();
+              return !Number.isNaN(createdTs) && createdTs >= sessTs;
+            });
+          }
+        } catch (e) {}
+      }
+
       if (list.length >= 2) {
         const prev = list[list.length - 2];
         const nowTs = now.getTime();
@@ -767,7 +783,7 @@ if (!cleared && hasSession && !last) {
         const prevStatus = computeStatusFromTicket(prev, now);
 
         // On n'affiche "Nouvelle commande" que si :
-        // - il y a au moins 2 tickets dans la journée pour cette table
+        // - il y a au moins 2 tickets dans la SESSION ACTIVE pour cette table
         // - la dernière commande est très récente (< NEW_ORDER_WINDOW_MS)
         // - la table n'est ni vide ni payée
         // - et le statut "avant" était déjà en préparation ou doit payé

@@ -42,6 +42,7 @@ app.use(express.json());
 const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 
 // Durées (en millisecondes)
+const ORDER_TO_PREP_MS = 120 * 1000; // délai d'affichage "Commandée" avant "En préparation" (impression cuisine immédiate)
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
 const NEW_ORDER_WINDOW_MS = 3 * 60 * 1000; // 3 min d'affichage pour le statut "Nouvelle commande"
 
@@ -510,7 +511,7 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
-      printedAt: null,
+      printedAt: nowIso(),
       paidAt: null,
       closedAt: null,
       paid: false,
@@ -620,8 +621,8 @@ function lastTicketForTable(table, businessDay) {
 /**
  * Calcule le statut d'une table en fonction de son dernier ticket.
  * Règles :
- * - tant que le ticket cuisine n'est pas imprimé → Commandée
- * - après /print → En préparation pendant PREP_MS
+ * - 0..120s après création → Commandée
+ * - après 120s (auto-print) ou /print → En préparation pendant PREP_MS
  * - ensuite → Doit payé
  * - après /confirm → Payée pendant PAY_CLEAR_MS, puis Vide
  */
@@ -643,14 +644,17 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.EMPTY;
   }
 
-  // 2) Tant que le ticket cuisine n'est pas imprimé → Commandée
-  const printedTs = ticket.printedAt ? new Date(ticket.printedAt).getTime() : null;
-  if (!printedTs || Number.isNaN(printedTs)) {
+  // 2) Timeline de statut (impression cuisine immédiate)
+  // On garde l'affichage "Commandée" un court délai, puis on passe en préparation automatiquement.
+  const orderToPrepAt = createdTs + ORDER_TO_PREP_MS;
+
+  // Tant qu'on est avant orderToPrepAt → Commandée
+  if (nowTs < orderToPrepAt) {
     return STATUS.ORDERED;
   }
 
   // 3) Pas payé : En préparation puis Doit payer
-  const diffPrep = nowTs - printedTs;
+  const diffPrep = nowTs - orderToPrepAt;
   if (diffPrep < PREP_MS) {
     return STATUS.PREP;
   }
@@ -717,21 +721,34 @@ if (!cleared && hasSession && !last) {
   effectiveStatus = STATUS.IN_PROGRESS;
 }
 
-    // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
-    // sans modifier les timers métiers existants.
+    // Surcharge éventuelle : "Nouvelle commande" uniquement si un ticket additionnel
+    // arrive dans la SESSION ACTUELLE de la table.
     if (!flags.closedManually && last && !cleared) {
-      const list = ticketsForTable(id, businessDay);
-      if (list.length >= 2) {
-        const prev = list[list.length - 2];
+      let sessionList = ticketsForTable(id, businessDay);
+
+      if (flags.sessionStartAt) {
+        try {
+          const sessTs = new Date(flags.sessionStartAt).getTime();
+          if (!Number.isNaN(sessTs)) {
+            sessionList = sessionList.filter((ticket) => {
+              const createdTs = new Date(ticket.createdAt).getTime();
+              return !Number.isNaN(createdTs) && createdTs >= sessTs;
+            });
+          }
+        } catch (e) {}
+      }
+
+      if (sessionList.length >= 2) {
+        const prev = sessionList[sessionList.length - 2];
         const nowTs = now.getTime();
         const lastCreatedTs = new Date(last.createdAt).getTime();
         const diffLast = nowTs - lastCreatedTs;
 
-        // Statut "avant" la nouvelle commande (sur le ticket précédent)
+        // Statut "avant" la nouvelle commande (sur le ticket précédent de la session courante)
         const prevStatus = computeStatusFromTicket(prev, now);
 
         // On n'affiche "Nouvelle commande" que si :
-        // - il y a au moins 2 tickets dans la journée pour cette table
+        // - il y a au moins 2 tickets dans la session actuelle
         // - la dernière commande est très récente (< NEW_ORDER_WINDOW_MS)
         // - la table n'est ni vide ni payée
         // - et le statut "avant" était déjà en préparation ou doit payé
@@ -848,7 +865,9 @@ function mountStaffRoutes(prefix = '') {
       const businessDay = getBusinessDayKey();
       const last = lastTicketForTable(table, businessDay);
       if (last) {
-        last.printedAt = nowIso();
+        // Impression cuisine = immédiate à la création du ticket.
+        // Ce endpoint sert uniquement à déclencher une réimpression (reprint) côté matériel.
+        // On ne modifie AUCUN timestamp ici pour ne pas casser la timeline des statuts.
       }
 
       res.json({ ok: true });

@@ -120,10 +120,26 @@ function ensureGuestCart(table, guestKey, guestName) {
   return carts[table].guests[guestKey];
 }
 
+function hasCartItemsForTable(table) {
+  const bucket = carts[table];
+  if (!bucket || !bucket.guests) return false;
+
+  return Object.values(bucket.guests).some((guest) => {
+    return Object.values((guest && guest.items) || {}).some((entry) => {
+      return Number((entry && entry.qty) || 0) > 0;
+    });
+  });
+}
+
 function cartPayloadForTable(table, requestingGuestKey) {
   const bucket = carts[table];
   if (!bucket || !bucket.guests) {
-    return { table, items: [], totals: { subtotal: 0, vat: 0, total: 0 } };
+    return {
+      table,
+      items: [],
+      totals: { subtotal: 0, vat: 0, total: 0 },
+      canSubmit: false,
+    };
   }
 
   const items = [];
@@ -158,7 +174,12 @@ function cartPayloadForTable(table, requestingGuestKey) {
   const vat = subtotal * 0.1;
   const total = Math.round((subtotal + vat) * 100) / 100;
 
-  return { table, items, totals: { subtotal, vat, total } };
+  return {
+    table,
+    items,
+    totals: { subtotal, vat, total },
+    canSubmit: items.length > 0,
+  };
 }
 
 // ---- Helpers temporels ----
@@ -425,6 +446,13 @@ app.post('/orders', (req, res) => {
     const rootClientName =
       typeof clientName === 'string' ? clientName.trim() : '';
 
+    if (!hasCartItemsForTable(t)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'cart_already_submitted',
+      });
+    }
+
     // Normalisation des items par rapport au menu + prénom & suppléments
     const normalized = items.map((it) => {
       const menuItem = MENU.find((m) => m.id === it.id) || {
@@ -519,6 +547,10 @@ app.post('/orders', (req, res) => {
     };
 
     tickets.push(ticket);
+
+    try {
+      delete carts[t];
+    } catch (e) {}
 
     res.json({ ok: true, ticket });
   } catch (err) {
@@ -721,34 +753,21 @@ if (!cleared && hasSession && !last) {
   effectiveStatus = STATUS.IN_PROGRESS;
 }
 
-    // Surcharge éventuelle : "Nouvelle commande" uniquement si un ticket additionnel
-    // arrive dans la SESSION ACTUELLE de la table.
+    // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
+    // sans modifier les timers métiers existants.
     if (!flags.closedManually && last && !cleared) {
-      let sessionList = ticketsForTable(id, businessDay);
-
-      if (flags.sessionStartAt) {
-        try {
-          const sessTs = new Date(flags.sessionStartAt).getTime();
-          if (!Number.isNaN(sessTs)) {
-            sessionList = sessionList.filter((ticket) => {
-              const createdTs = new Date(ticket.createdAt).getTime();
-              return !Number.isNaN(createdTs) && createdTs >= sessTs;
-            });
-          }
-        } catch (e) {}
-      }
-
-      if (sessionList.length >= 2) {
-        const prev = sessionList[sessionList.length - 2];
+      const list = ticketsForTable(id, businessDay);
+      if (list.length >= 2) {
+        const prev = list[list.length - 2];
         const nowTs = now.getTime();
         const lastCreatedTs = new Date(last.createdAt).getTime();
         const diffLast = nowTs - lastCreatedTs;
 
-        // Statut "avant" la nouvelle commande (sur le ticket précédent de la session courante)
+        // Statut "avant" la nouvelle commande (sur le ticket précédent)
         const prevStatus = computeStatusFromTicket(prev, now);
 
         // On n'affiche "Nouvelle commande" que si :
-        // - il y a au moins 2 tickets dans la session actuelle
+        // - il y a au moins 2 tickets dans la journée pour cette table
         // - la dernière commande est très récente (< NEW_ORDER_WINDOW_MS)
         // - la table n'est ni vide ni payée
         // - et le statut "avant" était déjà en préparation ou doit payé

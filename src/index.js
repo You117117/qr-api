@@ -653,7 +653,7 @@ function lastTicketForTable(table, businessDay) {
  * Calcule le statut d'une table en fonction de son dernier ticket.
  * Règles :
  * - tant que le ticket cuisine n'est pas imprimé → Commandée
- * - après /print → En préparation pendant PREP_MS
+ * - après impression (/print) → En préparation pendant PREP_MS
  * - ensuite → Doit payé
  * - après /confirm → Payée pendant PAY_CLEAR_MS, puis Vide
  */
@@ -665,7 +665,6 @@ function computeStatusFromTicket(ticket, now = new Date()) {
   const nowTs = now.getTime();
   const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
 
-  // 1) Paiement : Payée pendant PAY_CLEAR_MS, puis Vide
   if (paidTs) {
     const diffPaid = nowTs - paidTs;
     if (diffPaid < PAY_CLEAR_MS) {
@@ -674,18 +673,20 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.EMPTY;
   }
 
-  // 2) Tant que le ticket cuisine n'est pas imprimé → Commandée
   if (!ticket.printedAt) {
     return STATUS.ORDERED;
   }
 
-  // 3) Après impression : En préparation puis Doit payer
   const printedTs = new Date(ticket.printedAt).getTime();
-  const prepStartTs = Number.isNaN(printedTs) ? nowTs : printedTs;
-  const diffPrep = nowTs - prepStartTs;
+  if (Number.isNaN(printedTs)) {
+    return STATUS.ORDERED;
+  }
+
+  const diffPrep = nowTs - printedTs;
   if (diffPrep < PREP_MS) {
     return STATUS.PREP;
   }
+
   return STATUS.PAY_DUE;
 }
 
@@ -896,8 +897,6 @@ function mountStaffRoutes(prefix = '') {
       const businessDay = getBusinessDayKey();
       const last = lastTicketForTable(table, businessDay);
       if (last && !last.printedAt) {
-        // Le premier print manuel matérialise l'envoi cuisine.
-        // À partir de ce moment, le statut peut passer de Commandée à En préparation.
         last.printedAt = nowIso();
       }
 

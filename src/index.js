@@ -42,7 +42,6 @@ app.use(express.json());
 const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 
 // Durées (en millisecondes)
-const ORDER_TO_PREP_MS = 120 * 1000; // délai d'affichage "Commandée" avant "En préparation" (impression cuisine immédiate)
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
 const NEW_ORDER_WINDOW_MS = 3 * 60 * 1000; // 3 min d'affichage pour le statut "Nouvelle commande"
 
@@ -539,7 +538,7 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
-      printedAt: nowIso(),
+      printedAt: null,
       paidAt: null,
       closedAt: null,
       paid: false,
@@ -653,8 +652,8 @@ function lastTicketForTable(table, businessDay) {
 /**
  * Calcule le statut d'une table en fonction de son dernier ticket.
  * Règles :
- * - 0..120s après création → Commandée
- * - après 120s (auto-print) ou /print → En préparation pendant PREP_MS
+ * - tant que le ticket cuisine n'est pas imprimé → Commandée
+ * - après /print → En préparation pendant PREP_MS
  * - ensuite → Doit payé
  * - après /confirm → Payée pendant PAY_CLEAR_MS, puis Vide
  */
@@ -664,7 +663,6 @@ function computeStatusFromTicket(ticket, now = new Date()) {
   }
 
   const nowTs = now.getTime();
-  const createdTs = new Date(ticket.createdAt).getTime();
   const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
 
   // 1) Paiement : Payée pendant PAY_CLEAR_MS, puis Vide
@@ -676,17 +674,15 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.EMPTY;
   }
 
-  // 2) Timeline de statut (impression cuisine immédiate)
-  // On garde l'affichage "Commandée" un court délai, puis on passe en préparation automatiquement.
-  const orderToPrepAt = createdTs + ORDER_TO_PREP_MS;
-
-  // Tant qu'on est avant orderToPrepAt → Commandée
-  if (nowTs < orderToPrepAt) {
+  // 2) Tant que le ticket cuisine n'est pas imprimé → Commandée
+  if (!ticket.printedAt) {
     return STATUS.ORDERED;
   }
 
-  // 3) Pas payé : En préparation puis Doit payer
-  const diffPrep = nowTs - orderToPrepAt;
+  // 3) Après impression : En préparation puis Doit payer
+  const printedTs = new Date(ticket.printedAt).getTime();
+  const prepStartTs = Number.isNaN(printedTs) ? nowTs : printedTs;
+  const diffPrep = nowTs - prepStartTs;
   if (diffPrep < PREP_MS) {
     return STATUS.PREP;
   }
@@ -899,10 +895,10 @@ function mountStaffRoutes(prefix = '') {
 
       const businessDay = getBusinessDayKey();
       const last = lastTicketForTable(table, businessDay);
-      if (last) {
-        // Impression cuisine = immédiate à la création du ticket.
-        // Ce endpoint sert uniquement à déclencher une réimpression (reprint) côté matériel.
-        // On ne modifie AUCUN timestamp ici pour ne pas casser la timeline des statuts.
+      if (last && !last.printedAt) {
+        // Le premier print manuel matérialise l'envoi cuisine.
+        // À partir de ce moment, le statut peut passer de Commandée à En préparation.
+        last.printedAt = nowIso();
       }
 
       res.json({ ok: true });

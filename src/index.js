@@ -538,6 +538,7 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
+      sessionStartAt: tableState[t].sessionStartAt || createdAt,
       printedAt: null,
       paidAt: null,
       closedAt: null,
@@ -847,21 +848,45 @@ if (!cleared && hasSession && !last) {
 function summaryPayload() {
   const businessDay = getBusinessDayKey();
 
-  const list = tickets
+  const grouped = new Map();
+
+  tickets
     .filter((t) => t.date === businessDay)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    .map((t) => ({
-      id: t.id,
-      table: t.table,
-      total: t.total,
-      items: t.items,
-      clientName: t.clientName || null,
-      time: new Date(t.createdAt).toLocaleTimeString('fr-FR', {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
-      createdAt: t.createdAt,
-    }));
+    .forEach((t) => {
+      const sessionKey = t.sessionStartAt || t.createdAt;
+      const key = `${t.table}__${sessionKey}`;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          id: t.id,
+          table: t.table,
+          total: 0,
+          items: [],
+          clientName: t.clientName || null,
+          time: new Date(t.createdAt).toLocaleTimeString('fr-FR', {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          createdAt: t.createdAt,
+          sessionStartAt: sessionKey,
+        });
+      }
+
+      const entry = grouped.get(key);
+      entry.total = Math.round((entry.total + (Number(t.total) || 0)) * 100) / 100;
+      if (Array.isArray(t.items) && t.items.length) {
+        entry.items.push(...t.items);
+      }
+      if (t.clientName && !entry.clientName) {
+        entry.clientName = t.clientName;
+      }
+      if (t.createdAt > entry.createdAt) {
+        entry.createdAt = t.createdAt;
+      }
+    });
+
+  const list = Array.from(grouped.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
   return { tickets: list };
 }

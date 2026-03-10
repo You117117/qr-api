@@ -42,18 +42,16 @@ app.use(express.json());
 const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
 
 // Durées (en millisecondes)
-const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "Doit payé"
+const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "À encoder en caisse"
 
-// 🔴 Après Paiement confirmé : 5s "Payée" puis Vide (auto-clôture)
-const PAY_CLEAR_MS = 5 * 1000;
 const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
 const STATUS = {
   EMPTY: 'Vide',
   ORDERED: 'Commandée',
   PREP: 'En préparation',
-  PAY_DUE: 'Doit payé',
-  PAID: 'Payée',
+  PAY_DUE: 'À encoder en caisse',
+  PAID: 'Encodage caisse confirmé',
   IN_PROGRESS: 'En cours',
   NEW_ORDER: 'Nouvelle commande',
 };
@@ -655,8 +653,8 @@ function lastTicketForTable(table, businessDay) {
  * Règles :
  * - tant que le ticket cuisine n'est pas imprimé → Commandée
  * - après impression (/print) → En préparation pendant PREP_MS
- * - ensuite → Doit payé
- * - après /confirm → Payée pendant PAY_CLEAR_MS, puis Vide
+ * - ensuite → À encoder en caisse
+ * - après /confirm → Encodage caisse confirmé
  */
 function computeStatusFromTicket(ticket, now = new Date()) {
   if (!ticket) {
@@ -667,11 +665,7 @@ function computeStatusFromTicket(ticket, now = new Date()) {
   const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
 
   if (paidTs) {
-    const diffPaid = nowTs - paidTs;
-    if (diffPaid < PAY_CLEAR_MS) {
-      return STATUS.PAID;
-    }
-    return STATUS.EMPTY;
+    return STATUS.PAID;
   }
 
   if (!ticket.printedAt) {
@@ -719,24 +713,9 @@ function tablesPayload() {
 
   const statusFromTicket = computeStatusFromTicket(last, now);
 
-  // Auto-clear après paiement : table Vide + dernier ticket payé,
-  // UNIQUEMENT s'il n'y a PAS de session client en cours.
-  const autoCleared = !!(
-    statusFromTicket === STATUS.EMPTY &&
-    last &&
-    last.paidAt &&
-    !hasSession
-  );
+  const autoCleared = false;
 
-    // Si auto-cleared → on "reset" la sessionStartAt
-    if (autoCleared) {
-      if (!tableState[id]) {
-        tableState[id] = { closedManually: false, sessionStartAt: null };
-      }
-      tableState[id].sessionStartAt = null;
-    }
-
-    const cleared = !!(flags.closedManually || autoCleared);
+    const cleared = !!flags.closedManually;
 
     // Statut effectif renvoyé au front :
     // - si clôture manuelle → toujours "Vide"
@@ -953,6 +932,9 @@ function summaryPayload() {
           paidAt: t.paidAt || null,
           closedAt: t.closedAt || null,
           paid: !!t.paid,
+          posConfirmed: typeof t.posConfirmed === 'boolean' ? t.posConfirmed : null,
+          closedWithException: !!t.closedWithException,
+          exceptionReason: t.exceptionReason || null,
           sessionKey: t.sessionKey || group.sessionKey,
           sessionStartedAt: t.sessionStartedAt || group.sessionStartedAt,
         })),
@@ -1010,7 +992,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST confirm (paiement confirmé)
+  // POST confirm (encodage caisse confirmé)
   app.post(prefix + '/confirm', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();
@@ -1022,6 +1004,10 @@ function mountStaffRoutes(prefix = '') {
         const now = nowIso();
         last.paidAt = now;
         last.paid = true;
+        last.posConfirmed = true;
+        last.posConfirmedAt = now;
+        last.closedWithException = false;
+        last.exceptionReason = null;
       }
 
       res.json({ ok: true });
@@ -1031,7 +1017,7 @@ function mountStaffRoutes(prefix = '') {
     }
   });
 
-  // POST cancel-confirm (annuler paiement)
+  // POST cancel-confirm (annuler encodage caisse)
   app.post(prefix + '/cancel-confirm', (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();
@@ -1042,6 +1028,10 @@ function mountStaffRoutes(prefix = '') {
       if (last) {
         last.paidAt = null;
         last.paid = false;
+        last.posConfirmed = null;
+        last.posConfirmedAt = null;
+        last.closedWithException = false;
+        last.exceptionReason = null;
       }
 
       res.json({ ok: true });
@@ -1075,6 +1065,10 @@ function mountStaffRoutes(prefix = '') {
             (ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt) === activeSessionKey
           ) {
             ticket.closedAt = closedAt;
+            ticket.posConfirmed = posConfirmed;
+            ticket.posConfirmedAt = posConfirmed ? closedAt : (ticket.posConfirmedAt || null);
+            ticket.closedWithException = closedWithException;
+            ticket.exceptionReason = closedWithException ? 'POS_NON_CONFIRME' : null;
           }
         });
       }

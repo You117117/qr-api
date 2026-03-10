@@ -538,7 +538,8 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
-      sessionStartAt: tableState[t].sessionStartAt || createdAt,
+      sessionKey: tableState[t].sessionStartAt || createdAt,
+      sessionStartedAt: tableState[t].sessionStartAt || createdAt,
       printedAt: null,
       paidAt: null,
       closedAt: null,
@@ -843,50 +844,130 @@ if (!cleared && hasSession && !last) {
   return { tables: raw };
 }
 
-// ---- Payload /summary ----
 
-function summaryPayload() {
-  const businessDay = getBusinessDayKey();
+function computeSummarySessionStatus(sessionTickets, now = new Date()) {
+  if (!Array.isArray(sessionTickets) || !sessionTickets.length) {
+    return STATUS.EMPTY;
+  }
 
-  const grouped = new Map();
+  const sorted = [...sessionTickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const last = sorted[sorted.length - 1];
+  const statusFromLast = computeStatusFromTicket(last, now);
+
+  // Session manually closed or auto-closed after payment:
+  // keep the final meaningful historical state instead of falling back to "Vide".
+  if (last.closedAt) {
+    if (last.paidAt) return STATUS.PAID;
+    return 'Clôturée';
+  }
+
+  return statusFromLast;
+}
+
+function groupTicketsBySessionForDay(businessDay) {
+  const rows = [];
+  const groups = new Map();
 
   tickets
     .filter((t) => t.date === businessDay)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    .forEach((t) => {
-      const sessionKey = t.sessionStartAt || t.createdAt;
-      const key = `${t.table}__${sessionKey}`;
+    .forEach((ticket) => {
+      const sessionKey = ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt || `${ticket.table}-${ticket.id}`;
+      const groupKey = `${ticket.table}__${sessionKey}`;
 
-      if (!grouped.has(key)) {
-        grouped.set(key, {
+      if (!groups.has(groupKey)) {
+        const row = {
+          id: groupKey,
+          table: ticket.table,
+          sessionKey,
+          sessionStartedAt: ticket.sessionStartedAt || ticket.sessionKey || ticket.createdAt || null,
+          createdAt: ticket.createdAt,
+          updatedAt: ticket.createdAt,
+          tickets: [],
+        };
+        groups.set(groupKey, row);
+        rows.push(row);
+      }
+
+      const row = groups.get(groupKey);
+      row.tickets.push(ticket);
+
+      const createdAtTs = new Date(ticket.createdAt).getTime();
+      const updatedAtTs = new Date(row.updatedAt).getTime();
+      if (!Number.isNaN(createdAtTs) && !Number.isNaN(updatedAtTs) && createdAtTs > updatedAtTs) {
+        row.updatedAt = ticket.createdAt;
+      }
+    });
+
+  return rows;
+}
+
+// ---- Payload /summary ----
+
+function summaryPayload() {
+  const businessDay = getBusinessDayKey();
+  const now = new Date();
+
+  const list = groupTicketsBySessionForDay(businessDay)
+    .map((group) => {
+      const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
+      const status = computeSummarySessionStatus(orderedTickets, now);
+      const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
+      const closedAt = orderedTickets.reduce((latest, ticket) => {
+        if (!ticket.closedAt) return latest;
+        if (!latest) return ticket.closedAt;
+        return ticket.closedAt > latest ? ticket.closedAt : latest;
+      }, null);
+      const paidAt = orderedTickets.reduce((latest, ticket) => {
+        if (!ticket.paidAt) return latest;
+        if (!latest) return ticket.paidAt;
+        return ticket.paidAt > latest ? ticket.paidAt : latest;
+      }, null);
+
+      return {
+        id: group.id,
+        table: group.table,
+        sessionKey: group.sessionKey,
+        sessionStartedAt: group.sessionStartedAt,
+        total,
+        status,
+        time: new Date(group.createdAt).toLocaleTimeString('fr-FR', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        createdAt: group.createdAt,
+        updatedAt: group.updatedAt,
+        closedAt: closedAt || null,
+        paidAt: paidAt || null,
+        isClosed: !!closedAt,
+        tickets: orderedTickets.map((t) => ({
           id: t.id,
           table: t.table,
-          total: 0,
-          items: [],
+          total: t.total,
+          items: t.items,
           clientName: t.clientName || null,
           time: new Date(t.createdAt).toLocaleTimeString('fr-FR', {
             hour: '2-digit',
             minute: '2-digit',
           }),
           createdAt: t.createdAt,
-          sessionStartAt: sessionKey,
-        });
-      }
-
-      const entry = grouped.get(key);
-      entry.total = Math.round((entry.total + (Number(t.total) || 0)) * 100) / 100;
-      if (Array.isArray(t.items) && t.items.length) {
-        entry.items.push(...t.items);
-      }
-      if (t.clientName && !entry.clientName) {
-        entry.clientName = t.clientName;
-      }
-      if (t.createdAt > entry.createdAt) {
-        entry.createdAt = t.createdAt;
-      }
+          printedAt: t.printedAt || null,
+          paidAt: t.paidAt || null,
+          closedAt: t.closedAt || null,
+          paid: !!t.paid,
+          sessionKey: t.sessionKey || group.sessionKey,
+          sessionStartedAt: t.sessionStartedAt || group.sessionStartedAt,
+        })),
+        lastTicketId: lastTicket ? lastTicket.id : null,
+      };
+    })
+    .sort((a, b) => {
+      const aTs = new Date(a.updatedAt || a.createdAt).getTime();
+      const bTs = new Date(b.updatedAt || b.createdAt).getTime();
+      if (!Number.isNaN(aTs) && !Number.isNaN(bTs)) return bTs - aTs;
+      return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
     });
-
-  const list = Array.from(grouped.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
   return { tickets: list };
 }
@@ -985,6 +1066,22 @@ function mountStaffRoutes(prefix = '') {
       if (!tableState[table]) {
         tableState[table] = { closedManually: false, sessionStartAt: null };
       }
+
+      const activeSessionKey = tableState[table].sessionStartAt || null;
+      const closedAt = nowIso();
+
+      if (activeSessionKey) {
+        tickets.forEach((ticket) => {
+          if (
+            ticket.table === table &&
+            ticket.date === getBusinessDayKey() &&
+            (ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt) === activeSessionKey
+          ) {
+            ticket.closedAt = closedAt;
+          }
+        });
+      }
+
       tableState[table].closedManually = true;
       tableState[table].sessionStartAt = null;
 

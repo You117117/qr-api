@@ -1,45 +1,650 @@
-// QR Ordering API — backend en mémoire (Option A)
-// Logique centralisée des statuts de table + endpoints pour PWA client & staff.
+// QR Ordering API
+// Blocs 1-3 migrés vers la DB (tables, sessions, commandes)
+// Bloc 4: calcul centralisé des statuts métier côté backend.
+
+require('dotenv').config();
+
+const { createClient } = require('@supabase/supabase-js');
 
 const express = require('express');
 const cors = require('cors');
 const qrRouter = require('./qr');
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.get('/debug/tenants', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tenants')
+      .select('*')
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('GET /debug/tenants supabase error:', error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, tenants: data });
+  } catch (err) {
+    console.error('GET /debug/tenants unexpected error:', err);
+    return res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
+
+app.get('/debug/restaurant-tables', async (req, res) => {
+  try {
+    const tables = await getRestaurantTablesFromDb();
+    return res.json({ ok: true, tables });
+  } catch (err) {
+    console.error('GET /debug/restaurant-tables error:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'internal_error' });
+  }
+});
+
+app.get('/debug/sessions', async (_req, res) => {
+  try {
+    const storage = await detectSessionStorageMode();
+    if (storage !== 'db') {
+      return res.json({ ok: true, storage, sessions: tableState });
+    }
+
+    const sessionMap = await getActiveSessionsMapFromDb();
+    const businessDay = getBusinessDayKey();
+    const sessions = await Promise.all(Array.from(sessionMap.values()).map(async (sessionState) => {
+      const tableCode = normalizeTableCode(sessionState.tableCode);
+      const tableTickets = tableCode ? await ticketsForTable(tableCode, businessDay) : [];
+      const derived = deriveSessionBusinessState({
+        sessionState,
+        sessionTickets: tableTickets,
+        now: new Date(),
+      });
+      return {
+        ...sessionState,
+        rawStatus: sessionState.status || null,
+        status: derived.status,
+        pending: derived.pending,
+        lastTicketAt: derived.lastTicketAt,
+        lastTicket: derived.lastTicketSummary,
+      };
+    }));
+    return res.json({
+      ok: true,
+      storage,
+      startedAtColumn: SESSION_STARTED_AT_COLUMN,
+      sessions,
+    });
+  } catch (err) {
+    console.error('GET /debug/sessions error:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'internal_error' });
+  }
+});
+
+app.get('/debug/orders', async (_req, res) => {
+  try {
+    const businessDay = getBusinessDayKey();
+    const snapshot = await getOrderStorageSnapshot(businessDay);
+    return res.json({ ok: true, storage: snapshot.storage, businessDay, tickets: snapshot.tickets, error: snapshot.error || null });
+  } catch (err) {
+    console.error('GET /debug/orders error:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'internal_error' });
+  }
+});
+
 // ---- Session client (démarrage sans commande : prénom validé) ----
     // Body attendu : { table }
-    app.post('/session/start', (req, res) => {
+    app.post('/session/start', async (req, res) => {
       try {
-        const table = String(req.body?.table || '').trim();
+        const table = normalizeTableCode(req.body?.table || '');
         if (!table) return res.json({ ok: true });
 
-        if (!tableState[table]) {
-          tableState[table] = { closedManually: false, sessionStartAt: null };
-        }
+        const session = await ensureActiveSessionForTable(table, nowIso());
 
-        // Nouvelle session client => on annule éventuellement la clôture manuelle
-        tableState[table].closedManually = false;
-
-        let sessionStartAt = tableState[table].sessionStartAt;
-        if (!sessionStartAt) {
-          sessionStartAt = nowIso();
-          tableState[table].sessionStartAt = sessionStartAt;
-        }
-
-        return res.json({ ok: true, sessionStartAt });
+        return res.json({
+          ok: true,
+          storage: await detectTicketStorageMode(),
+          sessionStartAt: session.sessionStartAt || null,
+        });
       } catch (err) {
         console.error('POST /session/start error', err);
         return res.status(500).json({ ok: false, error: 'internal_error' });
       }
     });
 
-// ---- Constantes métier ----
+async function getRestaurantTablesFromDb() {
+  const { data, error } = await supabase
+    .from('restaurant_tables')
+    .select('id, tenant_id, code, label, seats, is_active, created_at')
+    .eq('is_active', true)
+    .order('code', { ascending: true });
 
-// Tables physiques disponibles (T1..T10)
-const TABLE_IDS = Array.from({ length: 10 }, (_, i) => `T${i + 1}`);
+  if (error) {
+    throw error;
+  }
+
+  return data || [];
+}
+
+async function getRestaurantTableCodesFromDb() {
+  const tables = await getRestaurantTablesFromDb();
+  return tables.map((t) => t.code);
+}
+
+async function getRestaurantTableByCodeFromDb(tableCode) {
+  const code = String(tableCode || '').trim().toUpperCase();
+  if (!code) return null;
+
+  const { data, error } = await supabase
+    .from('restaurant_tables')
+    .select('id, tenant_id, code, label, seats, is_active, created_at')
+    .eq('code', code)
+    .eq('is_active', true)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data || null;
+}
+
+const SESSION_TABLE = process.env.SESSION_TABLE || 'table_sessions';
+const SESSION_STARTED_AT_COLUMN = process.env.SESSION_STARTED_AT_COLUMN || 'opened_at';
+let sessionStorageModeCache = null;
+const ORDERS_TABLE = process.env.ORDERS_TABLE || 'orders';
+const ORDER_ITEMS_TABLE = process.env.ORDER_ITEMS_TABLE || 'order_items';
+let ticketStorageModeCache = null;
+
+function getBusinessDayRange(businessDay) {
+  const start = new Date(`${businessDay}T00:00:00.000Z`);
+  start.setUTCHours(RESET_HOUR, 0, 0, 0);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+async function detectTicketStorageMode() {
+  if (ticketStorageModeCache) return ticketStorageModeCache;
+  try {
+    const [ordersResp, itemsResp] = await Promise.all([
+      supabase.from(ORDERS_TABLE).select('id', { head: true, count: 'exact' }).limit(1),
+      supabase.from(ORDER_ITEMS_TABLE).select('id', { head: true, count: 'exact' }).limit(1),
+    ]);
+    if (ordersResp.error || itemsResp.error) {
+      const err = ordersResp.error || itemsResp.error;
+      console.warn(`[tickets] fallback mémoire activé: tables "${ORDERS_TABLE}" / "${ORDER_ITEMS_TABLE}" indisponibles`, err.message || err);
+      ticketStorageModeCache = 'memory';
+      return ticketStorageModeCache;
+    }
+    ticketStorageModeCache = 'db';
+    console.log(`[tickets] storage mode = db (${ORDERS_TABLE}, ${ORDER_ITEMS_TABLE})`);
+    return ticketStorageModeCache;
+  } catch (err) {
+    console.warn('[tickets] fallback mémoire activé: détection impossible', err.message || err);
+    ticketStorageModeCache = 'memory';
+    return ticketStorageModeCache;
+  }
+}
+
+function extrasToNotes(extras) {
+  if (!Array.isArray(extras) || !extras.length) return null;
+  const clean = extras.map((x) => String(x || '').trim()).filter(Boolean);
+  return clean.length ? `Extras: ${clean.join(', ')}` : null;
+}
+
+function notesToExtras(notes) {
+  const raw = String(notes || '').trim();
+  if (!raw.startsWith('Extras:')) return [];
+  return raw.slice(7).split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+function mapDbRowsToTicket(orderRow, itemRows, sessionRow, tableCode) {
+  const items = (itemRows || []).map((row) => ({
+    id: row.id,
+    name: row.product_name || 'Article',
+    qty: Number(row.quantity || 0),
+    price: Number(row.unit_price || 0),
+    clientName: row.guest_name || undefined,
+    extras: notesToExtras(row.notes),
+  }));
+  const total = items.reduce((sum, it) => sum + Number(it.qty || 0) * Number(it.price || 0), 0);
+  const createdAt = orderRow.created_at || nowIso();
+  return {
+    id: orderRow.id,
+    table: tableCode,
+    items,
+    total: Math.round(total * 100) / 100,
+    createdAt,
+    date: getBusinessDayKey(new Date(createdAt)),
+    sessionKey: sessionRow?.opened_at || sessionRow?.id || createdAt,
+    sessionStartedAt: sessionRow?.opened_at || null,
+    printedAt: orderRow.printed_at || null,
+    paidAt: sessionRow?.pos_confirmed_at || null,
+    closedAt: sessionRow?.closed_at || null,
+    paid: !!sessionRow?.pos_confirmed,
+    posConfirmed: !!sessionRow?.pos_confirmed,
+    posConfirmedAt: sessionRow?.pos_confirmed_at || null,
+    closedWithException: !!sessionRow?.closed_with_anomaly,
+    exceptionReason: sessionRow?.closed_with_anomaly ? 'POS_NON_CONFIRME' : null,
+    clientName: null,
+    sequenceInSession: orderRow.sequence_in_session || null,
+  };
+}
+
+async function getOrderStorageSnapshot(businessDay) {
+  const mode = await detectTicketStorageMode();
+  if (mode !== 'db') {
+    return {
+      storage: mode,
+      tickets: tickets.filter((t) => t.date === businessDay).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))),
+    };
+  }
+
+  const { startIso, endIso } = getBusinessDayRange(businessDay);
+  const { data: orderRows, error: ordersError } = await supabase
+    .from(ORDERS_TABLE)
+    .select('*')
+    .gte('created_at', startIso)
+    .lt('created_at', endIso)
+    .order('created_at', { ascending: true });
+
+  if (ordersError) {
+    console.error('[tickets] getOrderStorageSnapshot fallback mémoire:', ordersError.message || ordersError);
+    return {
+      storage: 'memory-fallback',
+      tickets: tickets.filter((t) => t.date === businessDay).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))),
+      error: ordersError.message || String(ordersError),
+    };
+  }
+
+  const orders = orderRows || [];
+  if (!orders.length) {
+    return { storage: 'db', tickets: [] };
+  }
+
+  const orderIds = orders.map((o) => o.id);
+  const sessionIds = [...new Set(orders.map((o) => o.table_session_id).filter(Boolean))];
+  const [itemsResp, sessionsResp, tables] = await Promise.all([
+    supabase.from(ORDER_ITEMS_TABLE).select('*').in('order_id', orderIds).order('created_at', { ascending: true }),
+    sessionIds.length ? supabase.from(SESSION_TABLE).select('*').in('id', sessionIds) : Promise.resolve({ data: [], error: null }),
+    getRestaurantTablesFromDb(),
+  ]);
+
+  if (itemsResp.error || sessionsResp.error) {
+    const err = itemsResp.error || sessionsResp.error;
+    console.error('[tickets] getOrderStorageSnapshot fallback mémoire:', err.message || err);
+    return {
+      storage: 'memory-fallback',
+      tickets: tickets.filter((t) => t.date === businessDay).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || ''))),
+      error: err.message || String(err),
+    };
+  }
+
+  const itemsByOrderId = new Map();
+  (itemsResp.data || []).forEach((row) => {
+    const arr = itemsByOrderId.get(row.order_id) || [];
+    arr.push(row);
+    itemsByOrderId.set(row.order_id, arr);
+  });
+  const sessionsById = new Map((sessionsResp.data || []).map((s) => [s.id, s]));
+  const codeByTableId = new Map((tables || []).map((t) => [t.id, normalizeTableCode(t.code)]));
+
+  return {
+    storage: 'db',
+    tickets: orders.map((orderRow) => {
+      const sessionRow = sessionsById.get(orderRow.table_session_id) || null;
+      const tableCode = codeByTableId.get(sessionRow?.table_id) || null;
+      return mapDbRowsToTicket(orderRow, itemsByOrderId.get(orderRow.id) || [], sessionRow, tableCode);
+    }).filter((t) => t.table),
+  };
+}
+
+async function syncSessionTotalInDb(sessionId) {
+  if (!sessionId) return null;
+  if ((await detectTicketStorageMode()) !== 'db') return null;
+
+  const { data: rows, error } = await supabase
+    .from(ORDERS_TABLE)
+    .select('id, table_session_id, order_items(quantity, unit_price)')
+    .eq('table_session_id', sessionId);
+
+  if (error) {
+    console.error('[tickets] syncSessionTotalInDb skipped:', error.message || error);
+    return null;
+  }
+
+  const total = (rows || []).reduce((sum, orderRow) => {
+    const nested = Array.isArray(orderRow.order_items) ? orderRow.order_items : [];
+    return sum + nested.reduce((s, item) => s + Number(item.quantity || 0) * Number(item.unit_price || 0), 0);
+  }, 0);
+
+  const rounded = Math.round(total * 100) / 100;
+  const { error: updateError } = await supabase
+    .from(SESSION_TABLE)
+    .update({ session_total: rounded })
+    .eq('id', sessionId);
+
+  if (updateError) {
+    console.error('[tickets] syncSessionTotalInDb update failed:', updateError.message || updateError);
+    return null;
+  }
+
+  return rounded;
+}
+
+async function listTicketsForBusinessDayFromDb(businessDay) {
+  const snapshot = await getOrderStorageSnapshot(businessDay);
+  return snapshot.tickets;
+}
+
+function normalizeTableCode(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function getFallbackTableState(tableCode) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  if (!tableState[table]) {
+    tableState[table] = { closedManually: false, sessionStartAt: null };
+  }
+
+  return tableState[table];
+}
+
+function getSessionStartedAt(row) {
+  if (!row || typeof row !== 'object') return null;
+  return row[SESSION_STARTED_AT_COLUMN] || row.opened_at || row.started_at || row.created_at || null;
+}
+
+async function detectSessionStorageMode() {
+  if (sessionStorageModeCache) {
+    return sessionStorageModeCache;
+  }
+
+  try {
+    const { error } = await supabase
+      .from(SESSION_TABLE)
+      .select(`id, ${SESSION_STARTED_AT_COLUMN}`, { head: true, count: 'exact' })
+      .limit(1);
+
+    if (error) {
+      console.warn(`[sessions] fallback mémoire activé: table "${SESSION_TABLE}" indisponible`, error.message || error);
+      sessionStorageModeCache = 'memory';
+      return sessionStorageModeCache;
+    }
+
+    sessionStorageModeCache = 'db';
+    console.log(`[sessions] storage mode = db (${SESSION_TABLE})`);
+    return sessionStorageModeCache;
+  } catch (err) {
+    console.warn(`[sessions] fallback mémoire activé: détection impossible sur "${SESSION_TABLE}"`, err.message || err);
+    sessionStorageModeCache = 'memory';
+    return sessionStorageModeCache;
+  }
+}
+
+function mapSessionRowToState(row, tableCode = null) {
+  if (!row) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  return {
+    id: row.id || null,
+    tenantId: row.tenant_id || null,
+    tableId: row.table_id || null,
+    tableCode: normalizeTableCode(tableCode || row.table_code || row.code || null),
+    closedManually: !!row.closed_manually || !!row.closed_with_anomaly || !!row.closed_at,
+    sessionStartAt: getSessionStartedAt(row),
+    closedAt: row.closed_at || null,
+    status: row.status || STATUS.EMPTY,
+    posConfirmed: !!row.pos_confirmed,
+    posConfirmedAt: row.pos_confirmed_at || null,
+    closedWithAnomaly: !!row.closed_with_anomaly,
+    sessionTotal: row.session_total ?? null,
+  };
+}
+
+async function getSessionStateForTable(tableCode) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  const mode = await detectSessionStorageMode();
+  if (mode !== 'db') {
+    return { ...getFallbackTableState(table) };
+  }
+
+  const tableRow = await getRestaurantTableByCodeFromDb(table);
+  if (!tableRow) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  const { data, error } = await supabase
+    .from(SESSION_TABLE)
+    .select('*')
+    .eq('table_id', tableRow.id)
+    .is('closed_at', null)
+    .order(SESSION_STARTED_AT_COLUMN, { ascending: false })
+    .limit(1);
+
+  if (error) {
+    console.error(`[sessions] getSessionStateForTable fallback mémoire for ${table}:`, error.message || error);
+    return { ...getFallbackTableState(table) };
+  }
+
+  const row = Array.isArray(data) && data.length ? data[0] : null;
+  if (!row) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  return mapSessionRowToState(row, tableRow.code);
+}
+
+async function getActiveSessionsMapFromDb() {
+  const mode = await detectSessionStorageMode();
+  const map = new Map();
+
+  if (mode !== 'db') {
+    Object.entries(tableState).forEach(([table, flags]) => {
+      map.set(table, {
+        id: null,
+        tenantId: null,
+        tableId: null,
+        tableCode: table,
+        closedManually: !!flags.closedManually,
+        sessionStartAt: flags.sessionStartAt || null,
+        closedAt: null,
+        status: STATUS.EMPTY,
+      });
+    });
+    return map;
+  }
+
+  const [sessionsResp, tables] = await Promise.all([
+    supabase
+      .from(SESSION_TABLE)
+      .select('*')
+      .is('closed_at', null)
+      .order(SESSION_STARTED_AT_COLUMN, { ascending: false }),
+    getRestaurantTablesFromDb(),
+  ]);
+
+  const { data, error } = sessionsResp;
+
+  if (error) {
+    console.error('[sessions] getActiveSessionsMapFromDb fallback mémoire:', error.message || error);
+    Object.entries(tableState).forEach(([table, flags]) => {
+      map.set(table, {
+        id: null,
+        tenantId: null,
+        tableId: null,
+        tableCode: table,
+        closedManually: !!flags.closedManually,
+        sessionStartAt: flags.sessionStartAt || null,
+        closedAt: null,
+        status: STATUS.EMPTY,
+      });
+    });
+    return map;
+  }
+
+  const codeByTableId = new Map((tables || []).map((row) => [row.id, normalizeTableCode(row.code)]));
+
+  (data || []).forEach((row) => {
+    const tableCode = codeByTableId.get(row.table_id) || normalizeTableCode(row.table_code);
+    if (!tableCode || map.has(tableCode)) return;
+    map.set(tableCode, mapSessionRowToState(row, tableCode));
+  });
+
+  return map;
+}
+
+async function ensureActiveSessionForTable(tableCode, startedAt = nowIso()) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { closedManually: false, sessionStartAt: null };
+  }
+
+  const current = await getSessionStateForTable(table);
+  if (current && current.sessionStartAt && !current.closedAt) {
+    if (!current.closedManually && current.sessionStartAt) {
+      const fallback = getFallbackTableState(table);
+      fallback.closedManually = false;
+      fallback.sessionStartAt = current.sessionStartAt;
+    }
+    return current;
+  }
+
+  const mode = await detectSessionStorageMode();
+  if (mode !== 'db') {
+    const fallback = getFallbackTableState(table);
+    fallback.closedManually = false;
+    if (!fallback.sessionStartAt) {
+      fallback.sessionStartAt = startedAt;
+    }
+    return { ...fallback, tableCode: table };
+  }
+
+  const tableRow = await getRestaurantTableByCodeFromDb(table);
+  if (!tableRow) {
+    const fallback = getFallbackTableState(table);
+    fallback.closedManually = false;
+    if (!fallback.sessionStartAt) {
+      fallback.sessionStartAt = startedAt;
+    }
+    return { ...fallback, tableCode: table };
+  }
+
+  const payload = {
+    tenant_id: tableRow.tenant_id,
+    table_id: tableRow.id,
+    closed_at: null,
+    status: STATUS.EMPTY,
+    pos_confirmed: false,
+    pos_confirmed_at: null,
+    closed_with_anomaly: false,
+    session_total: 0,
+  };
+
+  payload[SESSION_STARTED_AT_COLUMN] = startedAt;
+
+  const { data, error } = await supabase
+    .from(SESSION_TABLE)
+    .insert(payload)
+    .select('*')
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[sessions] ensureActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
+    const fallback = getFallbackTableState(table);
+    fallback.closedManually = false;
+    if (!fallback.sessionStartAt) {
+      fallback.sessionStartAt = startedAt;
+    }
+    return { ...fallback, tableCode: table };
+  }
+
+  const fallback = getFallbackTableState(table);
+  fallback.closedManually = false;
+  fallback.sessionStartAt = getSessionStartedAt(data) || startedAt;
+
+  return mapSessionRowToState(data, tableRow.code) || { ...fallback, tableCode: table };
+}
+
+async function closeActiveSessionForTable(tableCode, options = {}) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { ok: true, sessionStartAt: null, closedManually: true, mode: await detectSessionStorageMode() };
+  }
+
+  const {
+    closedAt = nowIso(),
+    closedManually = true,
+    posConfirmed = false,
+    closedWithAnomaly = false,
+  } = options || {};
+
+  const mode = await detectSessionStorageMode();
+  const fallback = getFallbackTableState(table);
+  fallback.closedManually = !!closedManually;
+  fallback.sessionStartAt = null;
+
+  if (mode !== 'db') {
+    return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory' };
+  }
+
+  const current = await getSessionStateForTable(table);
+  if (!current || !current.sessionStartAt || current.closedAt) {
+    return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db' };
+  }
+
+  const updatePayload = {
+    closed_at: closedAt,
+    status: posConfirmed ? STATUS.CLOSED : (closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED),
+    closed_with_anomaly: !!closedWithAnomaly,
+    pos_confirmed: !!posConfirmed,
+    pos_confirmed_at: posConfirmed ? closedAt : null,
+  };
+
+  const { error } = await supabase
+    .from(SESSION_TABLE)
+    .update(updatePayload)
+    .eq('id', current.id);
+
+  if (error) {
+    console.error(`[sessions] closeActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
+    return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory-fallback' };
+  }
+
+  return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db', closedAt };
+}
+
+async function reopenTableSessionState(tableCode) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { ok: true, sessionStartAt: null, closedManually: false };
+  }
+
+  const fallback = getFallbackTableState(table);
+  fallback.closedManually = false;
+
+  return { ok: true, sessionStartAt: fallback.sessionStartAt || null, closedManually: false };
+}
+
+// ---- Constantes métier ----
 
 // Durées (en millisecondes)
 const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "À encoder en caisse"
@@ -54,6 +659,8 @@ const STATUS = {
   PAID: 'Encodage caisse confirmé',
   IN_PROGRESS: 'En cours',
   NEW_ORDER: 'Nouvelle commande',
+  CLOSED: 'Clôturée',
+  CLOSED_WITH_ANOMALY: 'Clôture avec anomalie',
 };
 
 // ---- Mock menu ----
@@ -67,13 +674,16 @@ const MENU = [
   { id: 'm6', name: 'Coca 33cl',    price: 2.8,  category: 'Boissons' },
 ];
 
-// ---- Stockage en mémoire ----
+// ---- Stockage mémoire résiduel (fallback transitoire) ----
 
 let tickets = [];
 let seqId = 1;
 
-// ---- État des tables (clôture & session) ----
-// Exemple : tableState["T6"] = { closedManually: true, sessionStartAt: "2025-11-21T..." }
+// ---- État des tables (fallback legacy si la table Supabase des sessions n'existe pas encore) ----
+// IMPORTANT:
+// - bloc 2 = sessions pilotées par la DB en priorité
+// - ce store mémoire reste uniquement comme filet de sécurité pour ne pas casser le serveur
+//   tant que la table Supabase de sessions n'est pas encore présente / alignée.
 const tableState = {};
 
 
@@ -202,10 +812,10 @@ app.get('/health', (_req, res) => {
 });
 // ---- Validation de session côté client : GET /session/validate ----
 // Query params : table=T4&localSessionTs=ISO_OR_TS
-app.get('/session/validate', (req, res) => {
+app.get('/session/validate', async (req, res) => {
   try {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
-    const table = String(rawTable || '').trim().toUpperCase();
+    const table = normalizeTableCode(rawTable || '');
     const localSessionTsRaw = (req.query && req.query.localSessionTs) || '';
     const localSessionTs = String(localSessionTsRaw || '').trim() || null;
 
@@ -222,17 +832,14 @@ app.get('/session/validate', (req, res) => {
 
     const businessDay = getBusinessDayKey();
     let last = lastTicketForTable(table, businessDay);
-    const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
-    // Starting a new session must always start from a clean slate.
-    // If the table was cleared/closed or had no active session, purge server cart.
+    const flags = await getSessionStateForTable(table);
+
     if (!flags.sessionStartAt || flags.closedManually) {
       try { delete carts[table]; } catch (e) {}
     }
 
     const hasSession = !!flags.sessionStartAt;
 
-    // Si une nouvelle session client a démarré après le dernier ticket,
-    // on ignore ce ticket (ancienne session).
     if (hasSession && last) {
       try {
         const sessTs = new Date(flags.sessionStartAt).getTime();
@@ -246,8 +853,6 @@ app.get('/session/validate', (req, res) => {
     const now = new Date();
     const statusFromTicket = computeStatusFromTicket(last, now);
 
-    // Auto-clear après paiement : table Vide + dernier ticket payé,
-    // UNIQUEMENT s'il n'y a PAS de session client en cours.
     const autoCleared = !!(
       statusFromTicket === STATUS.EMPTY &&
       last &&
@@ -256,13 +861,16 @@ app.get('/session/validate', (req, res) => {
     );
 
     if (autoCleared) {
-      if (!tableState[table]) {
-        tableState[table] = { closedManually: false, sessionStartAt: null };
-      }
-      tableState[table].sessionStartAt = null;
+      await closeActiveSessionForTable(table, {
+        closedAt: nowIso(),
+        closedManually: false,
+      });
     }
 
-    const flagsAfter = tableState[table] || { closedManually: false, sessionStartAt: null };
+    const flagsAfter = autoCleared
+      ? { closedManually: false, sessionStartAt: null }
+      : await getSessionStateForTable(table);
+
     const cleared = !!(flagsAfter.closedManually || autoCleared);
     const sessionActive = !!(flagsAfter.sessionStartAt && !cleared);
     const serverSessionTs = sessionActive ? flagsAfter.sessionStartAt : null;
@@ -274,7 +882,6 @@ app.get('/session/validate', (req, res) => {
       shouldResetClient = true;
       reason = 'TABLE_CLEARED';
     } else {
-      // Session active côté backend, on compare les timestamps si dispo.
       if (!localSessionTs) {
         shouldResetClient = true;
         reason = 'MISSING_LOCAL_SESSION';
@@ -286,9 +893,7 @@ app.get('/session/validate', (req, res) => {
             shouldResetClient = true;
             reason = 'NEW_SESSION_ON_SERVER';
           }
-        } catch (e) {
-          // En cas de doute on ne force pas le reset, le front fera sa vie.
-        }
+        } catch (e) {}
       }
     }
 
@@ -299,6 +904,7 @@ app.get('/session/validate', (req, res) => {
       serverSessionTs,
       shouldResetClient,
       reason,
+      storage: await detectTicketStorageMode(),
     });
   } catch (err) {
     console.error('GET /session/validate error', err);
@@ -428,74 +1034,28 @@ app.get('/menu', (_req, res) => {
 
 // ---- Création de commande : POST /orders ----
 // Body attendu : { table, items:[{id, qty}] }
-app.post('/orders', (req, res) => {
+app.post('/orders', async (req, res) => {
   try {
     const { table, items, clientName } = req.body || {};
-    const t = String(table || '').trim();
-    if (!t) {
-      return res.status(400).json({ ok: false, error: 'missing table' });
-    }
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: 'empty items' });
-    }
+    const t = normalizeTableCode(table || '');
+    if (!t) return res.status(400).json({ ok: false, error: 'missing table' });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: 'empty items' });
 
-    const rootClientName =
-      typeof clientName === 'string' ? clientName.trim() : '';
+    const rootClientName = typeof clientName === 'string' ? clientName.trim() : '';
 
-    if (!hasCartItemsForTable(t)) {
-      return res.status(409).json({
-        ok: false,
-        error: 'cart_already_submitted',
-      });
-    }
-
-    // Normalisation des items par rapport au menu + prénom & suppléments
     const normalized = items.map((it) => {
-      const menuItem = MENU.find((m) => m.id === it.id) || {
-        price: it.price || 0,
-        name: it.name || 'Article',
-      };
-
+      const menuItem = MENU.find((m) => m.id === it.id) || { price: it.price || 0, name: it.name || 'Article' };
       const qty = Number(it.qty || it.quantity || 1);
-      const price = Number(
-        typeof it.price === 'number' ? it.price : menuItem.price || 0
-      );
-      const name = it.name || menuItem.name;
-
-      // Prénom / nom du client pour cette ligne
-      const lineClientNameRaw =
-        it.clientName ||
-        it.customerName ||
-        it.ownerName ||
-        rootClientName ||
-        '';
-
-      const lineClientName =
-        typeof lineClientNameRaw === 'string'
-          ? lineClientNameRaw.trim()
-          : '';
-
-      // Suppléments / options éventuels
-      let extrasSrc = null;
-      if (Array.isArray(it.extras)) extrasSrc = it.extras;
-      else if (Array.isArray(it.options)) extrasSrc = it.options;
-      else if (Array.isArray(it.supplements)) extrasSrc = it.supplements;
-      else if (Array.isArray(it.toppings)) extrasSrc = it.toppings;
-
-      const extras =
-        Array.isArray(extrasSrc)
-          ? extrasSrc
-              .map((e) =>
-                typeof e === 'string'
-                  ? e.trim()
-                  : (e && (e.label || e.name || e.title || '')).trim()
-              )
-              .filter(Boolean)
-          : [];
-
+      const price = Number(typeof it.price === 'number' ? it.price : menuItem.price || 0);
+      const lineClientNameRaw = it.clientName || it.customerName || it.ownerName || rootClientName || '';
+      const lineClientName = typeof lineClientNameRaw === 'string' ? lineClientNameRaw.trim() : '';
+      const extrasSrc = Array.isArray(it.extras) ? it.extras : Array.isArray(it.options) ? it.options : Array.isArray(it.supplements) ? it.supplements : Array.isArray(it.toppings) ? it.toppings : [];
+      const extras = extrasSrc
+        .map((e) => typeof e === 'string' ? e.trim() : (e && (e.label || e.name || e.title || '')).trim())
+        .filter(Boolean);
       return {
         id: it.id,
-        name,
+        name: it.name || menuItem.name,
         qty,
         price,
         clientName: lineClientName || undefined,
@@ -503,31 +1063,125 @@ app.post('/orders', (req, res) => {
       };
     });
 
-    const subtotal = normalized.reduce(
-      (sum, it) => sum + it.qty * it.price,
-      0
-    );
+    const createdAt = nowIso();
+    const businessDay = getBusinessDayKey(new Date(createdAt));
+    const session = await ensureActiveSessionForTable(t, createdAt);
+    const sessionKey = session.sessionStartAt || createdAt;
+    const ticketStorageMode = await detectTicketStorageMode();
+
+    if (ticketStorageMode === 'db') {
+      if (!session || !session.id || !session.tenantId) {
+        return res.status(409).json({
+          ok: false,
+          error: 'session_not_ready',
+          details: 'Aucune session DB active exploitable pour créer la commande.',
+          storage: 'db',
+        });
+      }
+
+      const { data: seqRows, error: seqError } = await supabase
+        .from(ORDERS_TABLE)
+        .select('sequence_in_session')
+        .eq('table_session_id', session.id)
+        .order('sequence_in_session', { ascending: false })
+        .limit(1);
+
+      if (seqError) {
+        console.error('POST /orders sequence lookup failed', seqError.message || seqError);
+        return res.status(500).json({
+          ok: false,
+          error: 'order_sequence_lookup_failed',
+          details: seqError.message || String(seqError),
+          storage: 'db',
+        });
+      }
+
+      const nextSeq = ((seqRows && seqRows[0] && seqRows[0].sequence_in_session) || 0) + 1;
+      const orderInsertPayload = {
+        tenant_id: session.tenantId,
+        table_session_id: session.id,
+        sequence_in_session: nextSeq,
+        order_type: nextSeq === 1 ? 'initial' : 'addition',
+        source: 'client',
+        printed_at: null,
+        created_at: createdAt,
+      };
+
+      const { data: orderRow, error: orderError } = await supabase
+        .from(ORDERS_TABLE)
+        .insert(orderInsertPayload)
+        .select('*')
+        .limit(1)
+        .maybeSingle();
+
+      if (orderError || !orderRow) {
+        console.error('POST /orders order insert failed', orderError?.message || orderError);
+        return res.status(500).json({
+          ok: false,
+          error: 'order_insert_failed',
+          details: orderError?.message || 'order_row_missing',
+          storage: 'db',
+          payload: orderInsertPayload,
+        });
+      }
+
+      const itemPayloads = normalized.map((it) => ({
+        tenant_id: session.tenantId,
+        order_id: orderRow.id,
+        product_name: it.name,
+        quantity: Number(it.qty || 0),
+        unit_price: Number(it.price || 0),
+        guest_name: it.clientName || null,
+        notes: extrasToNotes(it.extras),
+        created_at: createdAt,
+      }));
+
+      const { data: itemRows, error: itemError } = await supabase
+        .from(ORDER_ITEMS_TABLE)
+        .insert(itemPayloads)
+        .select('*');
+
+      if (itemError) {
+        console.error('POST /orders item insert failed', itemError.message || itemError);
+        await supabase.from(ORDERS_TABLE).delete().eq('id', orderRow.id);
+        return res.status(500).json({
+          ok: false,
+          error: 'order_items_insert_failed',
+          details: itemError.message || String(itemError),
+          storage: 'db',
+          orderId: orderRow.id,
+          itemPayloads,
+        });
+      }
+
+      const ticket = mapDbRowsToTicket(
+        orderRow,
+        itemRows || [],
+        {
+          id: session.id,
+          table_id: session.tableId,
+          opened_at: session.sessionStartAt,
+          closed_at: null,
+          pos_confirmed: false,
+          pos_confirmed_at: null,
+          closed_with_anomaly: false,
+        },
+        t
+      );
+
+      await syncSessionTotalInDb(session.id);
+      try { delete carts[t]; } catch (e) {}
+
+      return res.json({
+        ok: true,
+        storage: 'db',
+        ticket,
+      });
+    }
+
+    const subtotal = normalized.reduce((sum, it) => sum + it.qty * it.price, 0);
     const vat = subtotal * 0.1;
     const total = Math.round((subtotal + vat) * 100) / 100;
-
-    const now = new Date();
-    const createdAt = now.toISOString();
-    const businessDay = getBusinessDayKey(now);
-
-    // Initialiser ou mettre à jour l'état de la table
-    if (!tableState[t]) {
-      tableState[t] = { closedManually: false, sessionStartAt: null };
-    }
-
-    // Nouvelle commande = réouverture éventuelle de la table.
-    // Si la session était "reset" (sessionStartAt null), on démarre une NOUVELLE session.
-    tableState[t].closedManually = false;
-    if (!tableState[t].sessionStartAt) {
-      tableState[t].sessionStartAt = createdAt;
-    }
-
-    const ticketClientName = rootClientName || null;
-
     const ticket = {
       id: `TCK${seqId++}`,
       table: t,
@@ -535,60 +1189,45 @@ app.post('/orders', (req, res) => {
       total,
       createdAt,
       date: businessDay,
-      sessionKey: tableState[t].sessionStartAt || createdAt,
-      sessionStartedAt: tableState[t].sessionStartAt || createdAt,
+      sessionKey,
+      sessionStartedAt: sessionKey,
       printedAt: null,
       paidAt: null,
       closedAt: null,
       paid: false,
-      clientName: ticketClientName,
+      clientName: rootClientName || null,
     };
-
     tickets.push(ticket);
 
-    try {
-      delete carts[t];
-    } catch (e) {}
-
-    res.json({ ok: true, ticket });
+    try { delete carts[t]; } catch (e) {}
+    return res.json({ ok: true, storage: 'memory', ticket });
   } catch (err) {
     console.error('POST /orders error', err);
-    res.status(500).json({ ok: false, error: 'internal_error' });
+    return res.status(500).json({ ok: false, error: 'internal_error', details: err.message || String(err) });
   }
 });
 
 // ---- Récupération des commandes côté client : GET /client/orders?table=T4 ----
-app.get('/client/orders', (req, res) => {
+app.get('/client/orders', async (req, res) => {
   try {
     const rawTable = (req.query && (req.query.table || req.query.t)) || '';
-    const table = String(rawTable || '').trim().toUpperCase();
+    const table = normalizeTableCode(rawTable || '');
     if (!table) {
       return res.json({ ok: true, table: null, sessionActive: false, sessionStartAt: null, orders: [], mergedItems: [], grandTotal: 0 });
     }
 
     const businessDay = getBusinessDayKey();
-    let list = ticketsForTable(table, businessDay);
+    let list = await ticketsForTable(table, businessDay);
 
-    const flags = tableState[table] || { closedManually: false, sessionStartAt: null };
-    // IMPORTANT: if no active sessionStartAt, we must NOT return old tickets from earlier sessions.
+    const flags = await getSessionStateForTable(table);
     if (!flags.sessionStartAt) {
-      return res.json({ ok: true, table, sessionActive: false, sessionStartAt: null, orders: [], mergedItems: [], grandTotal: 0 });
+      return res.json({ ok: true, table, sessionActive: false, sessionStartAt: null, orders: [], mergedItems: [], grandTotal: 0, storage: await detectTicketStorageMode() });
     }
 
-    if (flags.sessionStartAt) {
-      try {
-        const sessTs = new Date(flags.sessionStartAt).getTime();
-        if (!Number.isNaN(sessTs)) {
-          list = list.filter((ticket) => {
-            const createdTs = new Date(ticket.createdAt).getTime();
-            return !Number.isNaN(createdTs) && createdTs >= sessTs;
-          });
-        }
-      } catch (e) {}
-    }
+    list = filterTicketsForSession(list, flags.sessionStartAt);
 
     if (!list.length) {
-      return res.json({ ok: true, table, sessionActive: true, sessionStartAt: flags.sessionStartAt, orders: [], mergedItems: [], grandTotal: 0 });
+      return res.json({ ok: true, table, sessionActive: true, sessionStartAt: flags.sessionStartAt, orders: [], mergedItems: [], grandTotal: 0, storage: await detectTicketStorageMode() });
     }
 
     const orders = list.map((ticket) => ({
@@ -629,6 +1268,7 @@ app.get('/client/orders', (req, res) => {
       orders,
       grandTotal,
       mergedItems,
+      storage: await detectTicketStorageMode(),
     });
   } catch (err) {
     console.error('GET /client/orders error', err);
@@ -637,14 +1277,13 @@ app.get('/client/orders', (req, res) => {
 });
 // ---- Helpers Staff ----
 
-function ticketsForTable(table, businessDay) {
-  return tickets
-    .filter((t) => t.table === table && t.date === businessDay)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+async function ticketsForTable(table, businessDay) {
+  const list = await listTicketsForBusinessDayFromDb(businessDay);
+  return list.filter((t) => t.table === table).sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
 }
 
-function lastTicketForTable(table, businessDay) {
-  const list = ticketsForTable(table, businessDay);
+async function lastTicketForTable(table, businessDay) {
+  const list = await ticketsForTable(table, businessDay);
   return list.length ? list[list.length - 1] : null;
 }
 
@@ -661,11 +1300,18 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.EMPTY;
   }
 
-  const nowTs = now.getTime();
-  const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
+  if (ticket.closedWithException) {
+    return STATUS.CLOSED_WITH_ANOMALY;
+  }
 
+  const paidTs = ticket.paidAt ? new Date(ticket.paidAt).getTime() : null;
   if (paidTs) {
+    if (ticket.closedAt) return STATUS.CLOSED;
     return STATUS.PAID;
+  }
+
+  if (ticket.closedAt) {
+    return STATUS.CLOSED;
   }
 
   if (!ticket.printedAt) {
@@ -677,6 +1323,7 @@ function computeStatusFromTicket(ticket, now = new Date()) {
     return STATUS.ORDERED;
   }
 
+  const nowTs = now.getTime();
   const diffPrep = nowTs - printedTs;
   if (diffPrep < PREP_MS) {
     return STATUS.PREP;
@@ -685,122 +1332,92 @@ function computeStatusFromTicket(ticket, now = new Date()) {
   return STATUS.PAY_DUE;
 }
 
+function filterTicketsForSession(ticketsList, sessionStartAt) {
+  const list = Array.isArray(ticketsList) ? [...ticketsList] : [];
+  if (!sessionStartAt) return list;
+
+  let sessionTs = null;
+  try {
+    sessionTs = new Date(sessionStartAt).getTime();
+  } catch (e) {
+    sessionTs = null;
+  }
+  if (sessionTs == null || Number.isNaN(sessionTs)) return list;
+
+  return list.filter((ticket) => {
+    const createdTs = new Date(ticket.createdAt).getTime();
+    return !Number.isNaN(createdTs) && createdTs >= sessionTs;
+  });
+}
+
+function deriveSessionBusinessState({ sessionState, sessionTickets, now = new Date() }) {
+  const hasSession = !!(sessionState && sessionState.sessionStartAt && !sessionState.closedAt);
+  const filteredTickets = filterTicketsForSession(sessionTickets || [], sessionState?.sessionStartAt)
+    .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+
+  const lastTicket = filteredTickets.length ? filteredTickets[filteredTickets.length - 1] : null;
+  const prevTicket = filteredTickets.length >= 2 ? filteredTickets[filteredTickets.length - 2] : null;
+
+  let status = STATUS.EMPTY;
+
+  if (lastTicket) {
+    status = computeStatusFromTicket(lastTicket, now);
+
+    const prevStatus = prevTicket ? computeStatusFromTicket(prevTicket, now) : null;
+    if (
+      !lastTicket.printedAt &&
+      prevTicket &&
+      [STATUS.ORDERED, STATUS.PREP, STATUS.PAY_DUE].includes(prevStatus)
+    ) {
+      status = STATUS.NEW_ORDER;
+    }
+  } else if (hasSession) {
+    status = STATUS.IN_PROGRESS;
+  }
+
+  const pending = lastTicket && !lastTicket.closedAt ? 1 : 0;
+
+  return {
+    hasSession,
+    tickets: filteredTickets,
+    lastTicket,
+    lastTicketAt: lastTicket ? lastTicket.createdAt : null,
+    lastTicketSummary: lastTicket ? { total: lastTicket.total, at: lastTicket.createdAt } : null,
+    status,
+    pending,
+  };
+}
+
 
 // ---- Payload /tables ----
 
-function tablesPayload() {
+async function tablesPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
+  const tableIds = await getRestaurantTableCodesFromDb();
+  const activeSessionsMap = await getActiveSessionsMapFromDb();
 
-  const raw = TABLE_IDS.map((id) => {
-  let last = lastTicketForTable(id, businessDay);
-  const flags = tableState[id] || { closedManually: false, sessionStartAt: null };
-
-  // Indique s'il y a une session client active (prénom validé)
-  const hasSession = !!flags.sessionStartAt;
-
-  // Si une nouvelle session client a démarré après le dernier ticket,
-  // on ignore ce ticket (il appartient à l'ancienne session).
-  if (hasSession && last) {
-    try{
-      const sessTs = new Date(flags.sessionStartAt).getTime();
-      const lastTs = new Date(last.createdAt).getTime();
-      if (!Number.isNaN(sessTs) && !Number.isNaN(lastTs) && lastTs < sessTs){
-        last = null;
-      }
-    }catch(e){}
-  }
-
-  const statusFromTicket = computeStatusFromTicket(last, now);
-
-  const autoCleared = false;
-
-    const cleared = !!flags.closedManually;
-
-    // Statut effectif renvoyé au front :
-    // - si clôture manuelle → toujours "Vide"
-    // - sinon ce que donne computeStatusFromTicket
-    let effectiveStatus = statusFromTicket;
-    if (flags.closedManually) {
-      effectiveStatus = STATUS.EMPTY;
-    }
-// Si une session client est ouverte et qu'il n'y a pas encore de ticket
-// pour cette session, on considère la table comme "En cours".
-if (!cleared && hasSession && !last) {
-  effectiveStatus = STATUS.IN_PROGRESS;
-}
-
-    // Surcharge éventuelle : "Nouvelle commande" quand un ticket additionnel récent arrive
-    // sans modifier les timers métiers existants.
-    if (!flags.closedManually && last && !cleared) {
-      let list = ticketsForTable(id, businessDay);
-
-      // IMPORTANT: "Nouvelle commande" must be evaluated only inside the CURRENT session.
-      // After a manual close/reset, old tickets from earlier sessions of the same day
-      // must not make the first ticket of the new session look like an additional order.
-      if (flags.sessionStartAt) {
-        try {
-          const sessTs = new Date(flags.sessionStartAt).getTime();
-          if (!Number.isNaN(sessTs)) {
-            list = list.filter((ticket) => {
-              const createdTs = new Date(ticket.createdAt).getTime();
-              return !Number.isNaN(createdTs) && createdTs >= sessTs;
-            });
-          }
-        } catch (e) {}
-      }
-
-      if (list.length >= 2) {
-        const prev = list[list.length - 2];
-
-        // Statut "avant" la nouvelle commande (sur le ticket précédent)
-        const prevStatus = computeStatusFromTicket(prev, now);
-
-        // "Nouvelle commande" doit rester affiché jusqu'à l'impression manuelle
-        // du DERNIER ticket de la session.
-        // Donc :
-        // - au moins 2 tickets dans la session active
-        // - dernier ticket pas encore imprimé
-        // - table ni vide ni payée
-        // - et le statut précédent était déjà en cours de traitement
-        if (
-          !last.printedAt &&
-          effectiveStatus !== STATUS.EMPTY &&
-          effectiveStatus !== STATUS.PAID &&
-          (prevStatus === STATUS.ORDERED || prevStatus === STATUS.PREP || prevStatus === STATUS.PAY_DUE)
-        ) {
-          effectiveStatus = STATUS.NEW_ORDER;
-        }
-      }
-    }
-
-    let lastTicketAt = last ? last.createdAt : null;
-    let lastTicket = last
-      ? { total: last.total, at: last.createdAt }
-      : null;
-
-    // Si la table est "cleared" (auto ou manuelle), on ne remonte plus le dernier ticket
-    if (cleared) {
-      lastTicketAt = null;
-      lastTicket = null;
-    }
-
-    const pending = effectiveStatus === STATUS.EMPTY ? 0 : 1;
+  const raw = await Promise.all(tableIds.map(async (id) => {
+    const sessionState = activeSessionsMap.get(id) || { closedManually: false, sessionStartAt: null, closedAt: null };
+    const tableTickets = await ticketsForTable(id, businessDay);
+    const derived = deriveSessionBusinessState({
+      sessionState,
+      sessionTickets: tableTickets,
+      now,
+    });
 
     return {
       id,
-      pending,
-      status: effectiveStatus,
-      lastTicketAt,
-      lastTicket,
-      cleared,
-      closedManually: !!flags.closedManually,
-      sessionStartAt: flags.sessionStartAt || null,
+      pending: derived.pending,
+      status: derived.status,
+      lastTicketAt: derived.lastTicketAt,
+      lastTicket: derived.lastTicketSummary,
+      cleared: !!sessionState.closedManually,
+      closedManually: !!sessionState.closedManually,
+      sessionStartAt: sessionState.sessionStartAt || null,
     };
-  });
+  }));
 
-  // Tri : d'abord les tables avec activité (dernier ticket), du plus récent au plus ancien,
-  // puis les tables vides par ordre naturel (T1, T2, ...)
   raw.sort((a, b) => {
     const aHas = !!a.lastTicketAt;
     const bHas = !!b.lastTicketAt;
@@ -817,35 +1434,30 @@ if (!cleared && hasSession && !last) {
     return new Date(b.lastTicketAt).getTime() - new Date(a.lastTicketAt).getTime();
   });
 
-  return { tables: raw };
+  return {
+    storage: await detectTicketStorageMode(),
+    tables: raw,
+  };
 }
 
 
 function computeSummarySessionStatus(sessionTickets, now = new Date()) {
-  if (!Array.isArray(sessionTickets) || !sessionTickets.length) {
-    return STATUS.EMPTY;
-  }
-
-  const sorted = [...sessionTickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const last = sorted[sorted.length - 1];
-  const statusFromLast = computeStatusFromTicket(last, now);
-
-  // Session manually closed or auto-closed after payment:
-  // keep the final meaningful historical state instead of falling back to "Vide".
-  if (last.closedAt) {
-    if (last.paidAt) return STATUS.PAID;
-    return 'Clôturée';
-  }
-
-  return statusFromLast;
+  const derived = deriveSessionBusinessState({
+    sessionState: {
+      sessionStartAt: Array.isArray(sessionTickets) && sessionTickets.length ? (sessionTickets[0].sessionStartedAt || null) : null,
+      closedAt: Array.isArray(sessionTickets) && sessionTickets.some((t) => !!t.closedAt) ? true : null,
+    },
+    sessionTickets,
+    now,
+  });
+  return derived.status;
 }
 
-function groupTicketsBySessionForDay(businessDay) {
+async function groupTicketsBySessionForDay(businessDay) {
   const rows = [];
   const groups = new Map();
 
-  tickets
-    .filter((t) => t.date === businessDay)
+  (await listTicketsForBusinessDayFromDb(businessDay))
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .forEach((ticket) => {
       const sessionKey = ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt || `${ticket.table}-${ticket.id}`;
@@ -880,11 +1492,11 @@ function groupTicketsBySessionForDay(businessDay) {
 
 // ---- Payload /summary ----
 
-function summaryPayload() {
+async function summaryPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
 
-  const list = groupTicketsBySessionForDay(businessDay)
+  const list = (await groupTicketsBySessionForDay(businessDay))
     .map((group) => {
       const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
@@ -954,9 +1566,9 @@ function summaryPayload() {
 
 function mountStaffRoutes(prefix = '') {
   // GET tables
-  app.get(prefix + '/tables', (_req, res) => {
+  app.get(prefix + '/tables', async (_req, res) => {
     try {
-      res.json(tablesPayload());
+      res.json(await tablesPayload());
     } catch (err) {
       console.error('GET /tables error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -964,9 +1576,9 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // GET summary
-  app.get(prefix + '/summary', (_req, res) => {
+  app.get(prefix + '/summary', async (_req, res) => {
     try {
-      res.json(summaryPayload());
+      res.json(await summaryPayload());
     } catch (err) {
       console.error('GET /summary error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -974,15 +1586,20 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // POST print
-  app.post(prefix + '/print', (req, res) => {
+  app.post(prefix + '/print', async (req, res) => {
     try {
       const table = String(req.body?.table || '').trim();
       if (!table) return res.json({ ok: true });
 
       const businessDay = getBusinessDayKey();
-      const last = lastTicketForTable(table, businessDay);
+      const last = await lastTicketForTable(table, businessDay);
       if (last && !last.printedAt) {
-        last.printedAt = nowIso();
+        const stamp = nowIso();
+        if ((await detectTicketStorageMode()) === 'db') {
+          await supabase.from(ORDERS_TABLE).update({ printed_at: stamp }).eq('id', last.id);
+        } else {
+          last.printedAt = stamp;
+        }
       }
 
       res.json({ ok: true });
@@ -993,15 +1610,23 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // POST confirm (encodage caisse confirmé)
-  app.post(prefix + '/confirm', (req, res) => {
+  app.post(prefix + '/confirm', async (req, res) => {
     try {
-      const table = String(req.body?.table || '').trim();
+      const table = normalizeTableCode(req.body?.table || '');
       if (!table) return res.json({ ok: true });
 
+      const now = nowIso();
+      const sessionState = await getSessionStateForTable(table);
+      if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
+        await supabase
+          .from(SESSION_TABLE)
+          .update({ status: STATUS.PAID, pos_confirmed: true, pos_confirmed_at: now, closed_with_anomaly: false })
+          .eq('id', sessionState.id);
+      }
+
       const businessDay = getBusinessDayKey();
-      const last = lastTicketForTable(table, businessDay);
+      const last = await lastTicketForTable(table, businessDay);
       if (last) {
-        const now = nowIso();
         last.paidAt = now;
         last.paid = true;
         last.posConfirmed = true;
@@ -1010,7 +1635,7 @@ function mountStaffRoutes(prefix = '') {
         last.exceptionReason = null;
       }
 
-      res.json({ ok: true });
+      res.json({ ok: true, storage: await detectSessionStorageMode(), confirmedAt: now });
     } catch (err) {
       console.error('POST /confirm error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1018,23 +1643,31 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // POST cancel-confirm (annuler encodage caisse)
-  app.post(prefix + '/cancel-confirm', (req, res) => {
+  app.post(prefix + '/cancel-confirm', async (req, res) => {
     try {
-      const table = String(req.body?.table || '').trim();
+      const table = normalizeTableCode(req.body?.table || '');
       if (!table) return res.json({ ok: true });
 
+      const sessionState = await getSessionStateForTable(table);
+      if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
+        await supabase
+          .from(SESSION_TABLE)
+          .update({ status: STATUS.PAY_DUE, pos_confirmed: false, pos_confirmed_at: null, closed_with_anomaly: false })
+          .eq('id', sessionState.id);
+      }
+
       const businessDay = getBusinessDayKey();
-      const last = lastTicketForTable(table, businessDay);
+      const last = await lastTicketForTable(table, businessDay);
       if (last) {
         last.paidAt = null;
         last.paid = false;
-        last.posConfirmed = null;
+        last.posConfirmed = false;
         last.posConfirmedAt = null;
         last.closedWithException = false;
         last.exceptionReason = null;
       }
 
-      res.json({ ok: true });
+      res.json({ ok: true, storage: await detectSessionStorageMode() });
     } catch (err) {
       console.error('POST /cancel-confirm error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1042,19 +1675,21 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // POST close-table (clôturer la table manuellement)
-  app.post(prefix + '/close-table', (req, res) => {
+  app.post(prefix + '/close-table', async (req, res) => {
     try {
-      const table = String(req.body?.table || '').trim();
-      // Manual close must clear any server-side shared cart so a new session starts clean.
+      const table = normalizeTableCode(req.body?.table || '');
+      const posConfirmed = !!req.body?.posConfirmed;
+      const closedWithException =
+        typeof req.body?.closedWithException === 'boolean'
+          ? !!req.body?.closedWithException
+          : !posConfirmed;
+
       try { delete carts[table]; } catch (e) {}
 
       if (!table) return res.json({ ok: true });
 
-      if (!tableState[table]) {
-        tableState[table] = { closedManually: false, sessionStartAt: null };
-      }
-
-      const activeSessionKey = tableState[table].sessionStartAt || null;
+      const sessionState = await getSessionStateForTable(table);
+      const activeSessionKey = sessionState.sessionStartAt || null;
       const closedAt = nowIso();
 
       if (activeSessionKey) {
@@ -1073,10 +1708,22 @@ function mountStaffRoutes(prefix = '') {
         });
       }
 
-      tableState[table].closedManually = true;
-      tableState[table].sessionStartAt = null;
+      if ((await detectTicketStorageMode()) === 'db' && sessionState && sessionState.id) {
+        await syncSessionTotalInDb(sessionState.id);
+      }
 
-      res.json({ ok: true });
+      await closeActiveSessionForTable(table, {
+        closedAt,
+        closedManually: true,
+        posConfirmed,
+        closedWithAnomaly: closedWithException,
+      });
+
+      res.json({
+        ok: true,
+        storage: await detectTicketStorageMode(),
+        closedAt,
+      });
     } catch (err) {
       console.error('POST /close-table error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1084,17 +1731,18 @@ function mountStaffRoutes(prefix = '') {
   });
 
   // POST cancel-close (annuler clôture manuelle)
-  app.post(prefix + '/cancel-close', (req, res) => {
+  app.post(prefix + '/cancel-close', async (req, res) => {
     try {
-      const table = String(req.body?.table || '').trim();
+      const table = normalizeTableCode(req.body?.table || '');
       if (!table) return res.json({ ok: true });
 
-      if (!tableState[table]) {
-        tableState[table] = { closedManually: false, sessionStartAt: null };
-      }
-      tableState[table].closedManually = false;
+      const state = await reopenTableSessionState(table);
 
-      res.json({ ok: true });
+      res.json({
+        ok: true,
+        storage: await detectTicketStorageMode(),
+        sessionStartAt: state.sessionStartAt || null,
+      });
     } catch (err) {
       console.error('POST /cancel-close error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });

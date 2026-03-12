@@ -8,7 +8,9 @@
     "dev": "NODE_ENV=development node src/index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.99.0",
     "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
     "express": "^4.19.2",
     "pdfkit": "^0.13.0",
     "qrcode": "^1.5.4"

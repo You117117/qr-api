@@ -765,7 +765,7 @@ async function reopenTableSessionState(tableCode) {
 // ---- Constantes métier ----
 
 // Durées (en millisecondes)
-const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "À encoder en caisse"
+const PREP_MS = 60 * 1000;    // 1 min de préparation avant "À encoder en caisse"
 
 const RESET_HOUR = 3;              // Changement de journée business à 03:00
 
@@ -1657,7 +1657,8 @@ async function evaluateTableClosureRequest(tableCode, body = {}) {
   const hasOrders = tableTickets.length > 0;
   const currentStatus = deriveSessionBusinessState({ sessionState, sessionTickets: tableTickets, now: new Date() }).status;
   const requestedClosureType = String(body?.closureType || '').trim().toLowerCase();
-  const closeAsAnomaly = requestedClosureType === 'anomaly' || !!body?.closedWithException;
+  const answer = String(body?.answer || '').trim().toUpperCase();
+  const closeAsAnomaly = requestedClosureType === 'anomaly' || !!body?.closedWithException || answer === 'NON';
   const note = typeof body?.note === 'string' ? body.note.trim() : '';
   const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
   const posConfirmedFlag = typeof body?.posConfirmed === 'boolean' ? body.posConfirmed : !!sessionState.posConfirmed;

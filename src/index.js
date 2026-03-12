@@ -58,21 +58,16 @@ app.get('/debug/sessions', async (_req, res) => {
 
     const sessionMap = await getActiveSessionsMapFromDb();
     const businessDay = getBusinessDayKey();
+    const now = new Date();
     const sessions = await Promise.all(Array.from(sessionMap.values()).map(async (sessionState) => {
-      const tableCode = normalizeTableCode(sessionState.tableCode);
-      const tableTickets = tableCode ? await ticketsForTable(tableCode, businessDay) : [];
-      const derived = deriveSessionBusinessState({
-        sessionState,
-        sessionTickets: tableTickets,
-        now: new Date(),
-      });
+      const businessState = await getTableBusinessState(sessionState.tableCode, businessDay, now, sessionMap);
       return {
         ...sessionState,
         rawStatus: sessionState.status || null,
-        status: derived.status,
-        pending: derived.pending,
-        lastTicketAt: derived.lastTicketAt,
-        lastTicket: derived.lastTicketSummary,
+        status: businessState.status,
+        pending: businessState.pending,
+        lastTicketAt: businessState.lastTicketAt,
+        lastTicket: businessState.lastTicketSummary,
       };
     }));
     return res.json({
@@ -1388,6 +1383,38 @@ function deriveSessionBusinessState({ sessionState, sessionTickets, now = new Da
   };
 }
 
+async function getTableBusinessState(tableCode, businessDay = getBusinessDayKey(), now = new Date(), activeSessionsMap = null) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return {
+      tableCode: null,
+      sessionState: { closedManually: false, sessionStartAt: null, closedAt: null },
+      hasSession: false,
+      tickets: [],
+      lastTicket: null,
+      lastTicketAt: null,
+      lastTicketSummary: null,
+      status: STATUS.EMPTY,
+      pending: 0,
+    };
+  }
+
+  const sessionState = activeSessionsMap?.get(table) || await getSessionStateForTable(table);
+  const tableTickets = await ticketsForTable(table, businessDay);
+  const derived = deriveSessionBusinessState({
+    sessionState,
+    sessionTickets: tableTickets,
+    now,
+  });
+
+  return {
+    tableCode: table,
+    sessionState,
+    ...derived,
+  };
+}
+
+
 
 // ---- Payload /tables ----
 
@@ -1398,20 +1425,15 @@ async function tablesPayload() {
   const activeSessionsMap = await getActiveSessionsMapFromDb();
 
   const raw = await Promise.all(tableIds.map(async (id) => {
-    const sessionState = activeSessionsMap.get(id) || { closedManually: false, sessionStartAt: null, closedAt: null };
-    const tableTickets = await ticketsForTable(id, businessDay);
-    const derived = deriveSessionBusinessState({
-      sessionState,
-      sessionTickets: tableTickets,
-      now,
-    });
+    const businessState = await getTableBusinessState(id, businessDay, now, activeSessionsMap);
+    const sessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
 
     return {
       id,
-      pending: derived.pending,
-      status: derived.status,
-      lastTicketAt: derived.lastTicketAt,
-      lastTicket: derived.lastTicketSummary,
+      pending: businessState.pending,
+      status: businessState.status,
+      lastTicketAt: businessState.lastTicketAt,
+      lastTicket: businessState.lastTicketSummary,
       cleared: !!sessionState.closedManually,
       closedManually: !!sessionState.closedManually,
       sessionStartAt: sessionState.sessionStartAt || null,
@@ -1442,12 +1464,15 @@ async function tablesPayload() {
 
 
 function computeSummarySessionStatus(sessionTickets, now = new Date()) {
+  const ordered = Array.isArray(sessionTickets)
+    ? [...sessionTickets].sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
+    : [];
   const derived = deriveSessionBusinessState({
     sessionState: {
-      sessionStartAt: Array.isArray(sessionTickets) && sessionTickets.length ? (sessionTickets[0].sessionStartedAt || null) : null,
-      closedAt: Array.isArray(sessionTickets) && sessionTickets.some((t) => !!t.closedAt) ? true : null,
+      sessionStartAt: ordered.length ? (ordered[0].sessionStartedAt || null) : null,
+      closedAt: ordered.some((t) => !!t.closedAt) ? true : null,
     },
-    sessionTickets,
+    sessionTickets: ordered,
     now,
   });
   return derived.status;

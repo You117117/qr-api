@@ -765,7 +765,7 @@ async function reopenTableSessionState(tableCode) {
 // ---- Constantes métier ----
 
 // Durées (en millisecondes)
-const PREP_MS = 20 * 60 * 1000;    // 20 min de préparation avant "À encoder en caisse"
+const PREP_MS = 60 * 1000;    // 1 min de préparation avant "À encoder en caisse"
 
 const RESET_HOUR = 3;              // Changement de journée business à 03:00
 

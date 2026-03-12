@@ -156,7 +156,9 @@ const SESSION_STARTED_AT_COLUMN = process.env.SESSION_STARTED_AT_COLUMN || 'open
 let sessionStorageModeCache = null;
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'orders';
 const ORDER_ITEMS_TABLE = process.env.ORDER_ITEMS_TABLE || 'order_items';
+const SESSION_EVENTS_TABLE = process.env.SESSION_EVENTS_TABLE || 'table_session_events';
 let ticketStorageModeCache = null;
+let sessionEventsStorageModeCache = null;
 
 function getBusinessDayRange(businessDay) {
   const start = new Date(`${businessDay}T00:00:00.000Z`);
@@ -199,6 +201,91 @@ function notesToExtras(notes) {
   const raw = String(notes || '').trim();
   if (!raw.startsWith('Extras:')) return [];
   return raw.slice(7).split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+async function detectSessionEventsStorageMode() {
+  if (sessionEventsStorageModeCache) return sessionEventsStorageModeCache;
+  try {
+    const { error } = await supabase
+      .from(SESSION_EVENTS_TABLE)
+      .select('id', { head: true, count: 'exact' })
+      .limit(1);
+
+    if (error) {
+      console.warn(`[session-events] journal DB indisponible sur "${SESSION_EVENTS_TABLE}":`, error.message || error);
+      sessionEventsStorageModeCache = 'disabled';
+      return sessionEventsStorageModeCache;
+    }
+
+    sessionEventsStorageModeCache = 'db';
+    console.log(`[session-events] storage mode = db (${SESSION_EVENTS_TABLE})`);
+    return sessionEventsStorageModeCache;
+  } catch (err) {
+    console.warn('[session-events] détection impossible:', err.message || err);
+    sessionEventsStorageModeCache = 'disabled';
+    return sessionEventsStorageModeCache;
+  }
+}
+
+function buildSessionEventPayload(eventType, sessionState, tableCode, extra = {}) {
+  return {
+    tenant_id: sessionState?.tenantId || extra.tenantId || null,
+    table_session_id: sessionState?.id || extra.sessionId || null,
+    table_id: sessionState?.tableId || extra.tableId || null,
+    table_code: normalizeTableCode(tableCode || sessionState?.tableCode || extra.tableCode || null),
+    event_type: String(eventType || '').trim() || 'unknown',
+    payload: {
+      status: extra.status || sessionState?.status || null,
+      posConfirmed: typeof extra.posConfirmed === 'boolean' ? extra.posConfirmed : !!sessionState?.posConfirmed,
+      closedWithAnomaly: typeof extra.closedWithAnomaly === 'boolean' ? extra.closedWithAnomaly : !!sessionState?.closedWithAnomaly,
+      reason: extra.reason || null,
+      note: extra.note || null,
+      source: extra.source || 'api',
+      staffId: extra.staffId || null,
+      total: typeof extra.total === 'number' ? extra.total : (sessionState?.sessionTotal ?? null),
+      metadata: extra.metadata || null,
+    },
+    created_at: extra.createdAt || nowIso(),
+  };
+}
+
+async function appendSessionEvent(eventType, sessionState, tableCode, extra = {}) {
+  const storage = await detectSessionEventsStorageMode();
+  const payload = buildSessionEventPayload(eventType, sessionState, tableCode, extra);
+
+  if (storage !== 'db') {
+    return { ok: false, storage, skipped: true, payload };
+  }
+
+  const { error } = await supabase.from(SESSION_EVENTS_TABLE).insert(payload);
+  if (error) {
+    console.error('[session-events] insert failed:', error.message || error, payload);
+    return { ok: false, storage: 'db-error', error: error.message || String(error), payload };
+  }
+
+  return { ok: true, storage: 'db' };
+}
+
+async function getSessionEventsForBusinessDay(businessDay) {
+  const storage = await detectSessionEventsStorageMode();
+  if (storage !== 'db') {
+    return { storage, events: [] };
+  }
+
+  const { startIso, endIso } = getBusinessDayRange(businessDay);
+  const { data, error } = await supabase
+    .from(SESSION_EVENTS_TABLE)
+    .select('*')
+    .gte('created_at', startIso)
+    .lt('created_at', endIso)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('[session-events] read failed:', error.message || error);
+    return { storage: 'db-error', events: [], error: error.message || String(error) };
+  }
+
+  return { storage: 'db', events: data || [] };
 }
 
 function mapDbRowsToTicket(orderRow, itemRows, sessionRow, tableCode) {
@@ -407,6 +494,7 @@ function mapSessionRowToState(row, tableCode = null) {
     posConfirmedAt: row.pos_confirmed_at || null,
     closedWithAnomaly: !!row.closed_with_anomaly,
     sessionTotal: row.session_total ?? null,
+    closureType: row.closed_with_anomaly ? 'anomaly' : (row.closed_at ? 'normal' : null),
   };
 }
 
@@ -590,6 +678,11 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     closedManually = true,
     posConfirmed = false,
     closedWithAnomaly = false,
+    reason = null,
+    note = null,
+    source = 'api',
+    staffId = null,
+    metadata = null,
   } = options || {};
 
   const mode = await detectSessionStorageMode();
@@ -608,10 +701,10 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
 
   const updatePayload = {
     closed_at: closedAt,
-    status: posConfirmed ? STATUS.CLOSED : (closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED),
+    status: closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED,
     closed_with_anomaly: !!closedWithAnomaly,
     pos_confirmed: !!posConfirmed,
-    pos_confirmed_at: posConfirmed ? closedAt : null,
+    pos_confirmed_at: posConfirmed ? (current.posConfirmedAt || closedAt) : null,
   };
 
   const { error } = await supabase
@@ -624,7 +717,37 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory-fallback' };
   }
 
-  return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db', closedAt };
+  const sessionTotal = await syncSessionTotalInDb(current.id);
+  await appendSessionEvent('session_closed', {
+    ...current,
+    status: updatePayload.status,
+    posConfirmed: !!updatePayload.pos_confirmed,
+    posConfirmedAt: updatePayload.pos_confirmed_at,
+    closedWithAnomaly: !!updatePayload.closed_with_anomaly,
+    sessionTotal: sessionTotal ?? current.sessionTotal ?? null,
+  }, table, {
+    createdAt: closedAt,
+    posConfirmed: !!updatePayload.pos_confirmed,
+    closedWithAnomaly: !!updatePayload.closed_with_anomaly,
+    reason,
+    note,
+    source,
+    staffId,
+    total: sessionTotal ?? current.sessionTotal ?? null,
+    metadata,
+    status: updatePayload.status,
+  });
+
+  return {
+    ok: true,
+    sessionStartAt: null,
+    closedManually: !!closedManually,
+    mode: 'db',
+    closedAt,
+    closureType: closedWithAnomaly ? 'anomaly' : 'normal',
+    posConfirmed: !!updatePayload.pos_confirmed,
+    reason: reason || null,
+  };
 }
 
 async function reopenTableSessionState(tableCode) {
@@ -1517,6 +1640,79 @@ async function groupTicketsBySessionForDay(businessDay) {
 
 // ---- Payload /summary ----
 
+
+async function evaluateTableClosureRequest(tableCode, body = {}) {
+  const table = normalizeTableCode(tableCode);
+  if (!table) {
+    return { ok: false, code: 'missing_table', httpStatus: 400, message: 'Table manquante.' };
+  }
+
+  const sessionState = await getSessionStateForTable(table);
+  if (!sessionState || !sessionState.sessionStartAt || sessionState.closedAt) {
+    return { ok: false, code: 'no_active_session', httpStatus: 409, message: 'Aucune session active à clôturer.', sessionState };
+  }
+
+  const businessDay = getBusinessDayKey();
+  const tableTickets = filterTicketsForSession(await ticketsForTable(table, businessDay), sessionState.sessionStartAt);
+  const hasOrders = tableTickets.length > 0;
+  const currentStatus = deriveSessionBusinessState({ sessionState, sessionTickets: tableTickets, now: new Date() }).status;
+  const requestedClosureType = String(body?.closureType || '').trim().toLowerCase();
+  const closeAsAnomaly = requestedClosureType === 'anomaly' || !!body?.closedWithException;
+  const note = typeof body?.note === 'string' ? body.note.trim() : '';
+  const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  const posConfirmedFlag = typeof body?.posConfirmed === 'boolean' ? body.posConfirmed : !!sessionState.posConfirmed;
+
+  if (!hasOrders) {
+    return {
+      ok: false,
+      code: 'no_orders_for_session',
+      httpStatus: 409,
+      message: 'Impossible de clôturer une session sans commande.',
+      sessionState,
+      currentStatus,
+      tableTickets,
+    };
+  }
+
+  if (!closeAsAnomaly) {
+    if (!sessionState.posConfirmed) {
+      return {
+        ok: false,
+        code: 'pos_confirmation_required',
+        httpStatus: 409,
+        message: 'Encodage caisse obligatoire avant clôture normale.',
+        sessionState,
+        currentStatus,
+        tableTickets,
+      };
+    }
+
+    return {
+      ok: true,
+      closureType: 'normal',
+      closedWithAnomaly: false,
+      posConfirmed: true,
+      reason: null,
+      note: note || null,
+      sessionState,
+      currentStatus,
+      tableTickets,
+    };
+  }
+
+  return {
+    ok: true,
+    closureType: 'anomaly',
+    closedWithAnomaly: true,
+    posConfirmed: posConfirmedFlag,
+    reason: reason || 'MANUAL_ANOMALY',
+    note: note || null,
+    sessionState,
+    currentStatus,
+    tableTickets,
+  };
+}
+
 async function summaryPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
@@ -1554,6 +1750,7 @@ async function summaryPayload() {
         closedAt: closedAt || null,
         paidAt: paidAt || null,
         isClosed: !!closedAt,
+        closureType: orderedTickets.some((t) => !!t.closedWithException) ? 'anomaly' : (closedAt ? 'normal' : null),
         tickets: orderedTickets.map((t) => ({
           id: t.id,
           table: t.table,
@@ -1642,11 +1839,19 @@ function mountStaffRoutes(prefix = '') {
 
       const now = nowIso();
       const sessionState = await getSessionStateForTable(table);
+      if (!sessionState || !sessionState.sessionStartAt || sessionState.closedAt) {
+        return res.status(409).json({ ok: false, error: 'no_active_session', message: 'Aucune session active à confirmer.' });
+      }
+
       if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
-        await supabase
+        const { error } = await supabase
           .from(SESSION_TABLE)
           .update({ status: STATUS.PAID, pos_confirmed: true, pos_confirmed_at: now, closed_with_anomaly: false })
           .eq('id', sessionState.id);
+
+        if (error) {
+          throw error;
+        }
       }
 
       const businessDay = getBusinessDayKey();
@@ -1660,7 +1865,22 @@ function mountStaffRoutes(prefix = '') {
         last.exceptionReason = null;
       }
 
-      res.json({ ok: true, storage: await detectSessionStorageMode(), confirmedAt: now });
+      await appendSessionEvent('pos_confirmed', {
+        ...sessionState,
+        status: STATUS.PAID,
+        posConfirmed: true,
+        posConfirmedAt: now,
+        closedWithAnomaly: false,
+      }, table, {
+        createdAt: now,
+        posConfirmed: true,
+        closedWithAnomaly: false,
+        source: 'staff_confirm',
+        status: STATUS.PAID,
+        total: sessionState.sessionTotal ?? null,
+      });
+
+      res.json({ ok: true, storage: await detectSessionStorageMode(), confirmedAt: now, journalStorage: await detectSessionEventsStorageMode() });
     } catch (err) {
       console.error('POST /confirm error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1674,11 +1894,19 @@ function mountStaffRoutes(prefix = '') {
       if (!table) return res.json({ ok: true });
 
       const sessionState = await getSessionStateForTable(table);
+      if (!sessionState || !sessionState.sessionStartAt || sessionState.closedAt) {
+        return res.status(409).json({ ok: false, error: 'no_active_session', message: 'Aucune session active à rouvrir.' });
+      }
+
       if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
-        await supabase
+        const { error } = await supabase
           .from(SESSION_TABLE)
           .update({ status: STATUS.PAY_DUE, pos_confirmed: false, pos_confirmed_at: null, closed_with_anomaly: false })
           .eq('id', sessionState.id);
+
+        if (error) {
+          throw error;
+        }
       }
 
       const businessDay = getBusinessDayKey();
@@ -1692,7 +1920,22 @@ function mountStaffRoutes(prefix = '') {
         last.exceptionReason = null;
       }
 
-      res.json({ ok: true, storage: await detectSessionStorageMode() });
+      await appendSessionEvent('pos_confirmation_cancelled', {
+        ...sessionState,
+        status: STATUS.PAY_DUE,
+        posConfirmed: false,
+        posConfirmedAt: null,
+        closedWithAnomaly: false,
+      }, table, {
+        createdAt: nowIso(),
+        posConfirmed: false,
+        closedWithAnomaly: false,
+        source: 'staff_cancel_confirm',
+        status: STATUS.PAY_DUE,
+        total: sessionState.sessionTotal ?? null,
+      });
+
+      res.json({ ok: true, storage: await detectSessionStorageMode(), journalStorage: await detectSessionEventsStorageMode() });
     } catch (err) {
       console.error('POST /cancel-confirm error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
@@ -1703,19 +1946,23 @@ function mountStaffRoutes(prefix = '') {
   app.post(prefix + '/close-table', async (req, res) => {
     try {
       const table = normalizeTableCode(req.body?.table || '');
-      const posConfirmed = !!req.body?.posConfirmed;
-      const closedWithException =
-        typeof req.body?.closedWithException === 'boolean'
-          ? !!req.body?.closedWithException
-          : !posConfirmed;
+      if (!table) return res.json({ ok: true });
+
+      const evaluation = await evaluateTableClosureRequest(table, req.body || {});
+      if (!evaluation.ok) {
+        return res.status(evaluation.httpStatus || 409).json({
+          ok: false,
+          error: evaluation.code,
+          message: evaluation.message,
+          currentStatus: evaluation.currentStatus || null,
+          posConfirmed: !!evaluation.sessionState?.posConfirmed,
+        });
+      }
 
       try { delete carts[table]; } catch (e) {}
 
-      if (!table) return res.json({ ok: true });
-
-      const sessionState = await getSessionStateForTable(table);
-      const activeSessionKey = sessionState.sessionStartAt || null;
       const closedAt = nowIso();
+      const activeSessionKey = evaluation.sessionState.sessionStartAt || null;
 
       if (activeSessionKey) {
         tickets.forEach((ticket) => {
@@ -1725,29 +1972,39 @@ function mountStaffRoutes(prefix = '') {
             (ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt) === activeSessionKey
           ) {
             ticket.closedAt = closedAt;
-            ticket.posConfirmed = posConfirmed;
-            ticket.posConfirmedAt = posConfirmed ? closedAt : (ticket.posConfirmedAt || null);
-            ticket.closedWithException = closedWithException;
-            ticket.exceptionReason = closedWithException ? 'POS_NON_CONFIRME' : null;
+            ticket.posConfirmed = evaluation.posConfirmed;
+            ticket.posConfirmedAt = evaluation.posConfirmed ? (ticket.posConfirmedAt || evaluation.sessionState.posConfirmedAt || closedAt) : null;
+            ticket.closedWithException = evaluation.closedWithAnomaly;
+            ticket.exceptionReason = evaluation.closedWithAnomaly ? evaluation.reason : null;
           }
         });
       }
 
-      if ((await detectTicketStorageMode()) === 'db' && sessionState && sessionState.id) {
-        await syncSessionTotalInDb(sessionState.id);
-      }
-
-      await closeActiveSessionForTable(table, {
+      const result = await closeActiveSessionForTable(table, {
         closedAt,
         closedManually: true,
-        posConfirmed,
-        closedWithAnomaly: closedWithException,
+        posConfirmed: evaluation.posConfirmed,
+        closedWithAnomaly: evaluation.closedWithAnomaly,
+        reason: evaluation.reason,
+        note: evaluation.note,
+        source: 'staff_close_table',
+        metadata: {
+          currentStatus: evaluation.currentStatus,
+          requestedClosureType: evaluation.closureType,
+          ticketCount: evaluation.tableTickets.length,
+        },
       });
 
       res.json({
         ok: true,
         storage: await detectTicketStorageMode(),
+        journalStorage: await detectSessionEventsStorageMode(),
         closedAt,
+        closureType: evaluation.closureType,
+        posConfirmed: evaluation.posConfirmed,
+        reason: evaluation.reason,
+        note: evaluation.note,
+        result,
       });
     } catch (err) {
       console.error('POST /close-table error', err);
@@ -1761,12 +2018,17 @@ function mountStaffRoutes(prefix = '') {
       const table = normalizeTableCode(req.body?.table || '');
       if (!table) return res.json({ ok: true });
 
-      const state = await reopenTableSessionState(table);
+      await appendSessionEvent('cancel_close_rejected', null, table, {
+        createdAt: nowIso(),
+        source: 'staff_cancel_close',
+        reason: 'IMMUTABLE_CLOSURE',
+        note: 'Une session clôturée ne peut pas être réouverte automatiquement.',
+      });
 
-      res.json({
-        ok: true,
-        storage: await detectTicketStorageMode(),
-        sessionStartAt: state.sessionStartAt || null,
+      return res.status(409).json({
+        ok: false,
+        error: 'immutable_closure',
+        message: 'Une session clôturée ne peut pas être réouverte. Il faut ouvrir une nouvelle session.',
       });
     } catch (err) {
       console.error('POST /cancel-close error', err);

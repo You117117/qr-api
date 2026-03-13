@@ -1624,52 +1624,23 @@ async function tablesPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
   const tableIds = await getRestaurantTableCodesFromDb();
-  const [activeSessionsMap, latestSessionsMap] = await Promise.all([
-    getActiveSessionsMapFromDb(),
-    getLatestSessionsMapFromDb(),
-  ]);
+  const activeSessionsMap = await getActiveSessionsMapFromDb();
 
   const raw = await Promise.all(tableIds.map(async (id) => {
     const businessState = await getTableBusinessState(id, businessDay, now, activeSessionsMap);
     const activeSessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
-    const latestSessionState = latestSessionsMap.get(id) || null;
 
-    let status = businessState.status;
-    let pending = businessState.pending;
-    let lastTicketAt = businessState.lastTicketAt;
-    let lastTicket = businessState.lastTicketSummary;
-    let cleared = !!activeSessionState.closedManually;
-    let closedManually = !!activeSessionState.closedManually;
-    let sessionStartAt = activeSessionState.sessionStartAt || null;
-
-    const noActiveSession = !(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
-    const canShowLatestClosedState = (
-      noActiveSession &&
-      latestSessionState &&
-      latestSessionState.closedAt &&
-      isIsoInCurrentBusinessDay(latestSessionState.closedAt)
-    );
-
-    if (canShowLatestClosedState) {
-      status = latestSessionState.closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED;
-      pending = 0;
-      cleared = true;
-      closedManually = true;
-      sessionStartAt = latestSessionState.sessionStartAt || null;
-      if (!lastTicketAt && latestSessionState.closedAt) {
-        lastTicketAt = latestSessionState.closedAt;
-      }
-    }
+    const hasActiveSession = !!(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
 
     return {
       id,
-      pending,
-      status,
-      lastTicketAt,
-      lastTicket,
-      cleared,
-      closedManually,
-      sessionStartAt,
+      pending: hasActiveSession ? businessState.pending : 0,
+      status: hasActiveSession ? businessState.status : STATUS.EMPTY,
+      lastTicketAt: hasActiveSession ? businessState.lastTicketAt : null,
+      lastTicket: hasActiveSession ? businessState.lastTicketSummary : null,
+      cleared: !hasActiveSession,
+      closedManually: !hasActiveSession,
+      sessionStartAt: hasActiveSession ? (activeSessionState.sessionStartAt || null) : null,
     };
   }));
 
@@ -1832,7 +1803,7 @@ async function summaryPayload() {
     .map((group) => {
       const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
-      const status = computeSummarySessionStatus(orderedTickets, now);
+      const businessStatus = computeSummarySessionStatus(orderedTickets, now);
       const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
       const closedAt = orderedTickets.reduce((latest, ticket) => {
         if (!ticket.closedAt) return latest;
@@ -1844,6 +1815,13 @@ async function summaryPayload() {
         if (!latest) return ticket.paidAt;
         return ticket.paidAt > latest ? ticket.paidAt : latest;
       }, null);
+      const closedWithException = orderedTickets.some((t) => !!t.closedWithException);
+      const posConfirmed = orderedTickets.some((t) => !!t.posConfirmed);
+
+      let status = businessStatus;
+      if (closedAt) {
+        status = closedWithException ? 'Anomalie pas encodé' : (posConfirmed ? 'Encodé dans la caisse' : 'Clôturée');
+      }
 
       return {
         id: group.id,

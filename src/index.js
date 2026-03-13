@@ -745,7 +745,14 @@ async function ensureActiveSessionForTable(tableCode, startedAt = nowIso()) {
 async function closeActiveSessionForTable(tableCode, options = {}) {
   const table = normalizeTableCode(tableCode);
   if (!table) {
-    return { ok: true, sessionStartAt: null, closedManually: true, mode: await detectSessionStorageMode() };
+    return {
+      ok: false,
+      sessionStartAt: null,
+      closedManually: true,
+      mode: await detectSessionStorageMode(),
+      error: 'missing_table',
+      message: 'Table manquante pour la clôture.',
+    };
   }
 
   const {
@@ -773,35 +780,80 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
   const current = (sessionState && sessionState.id)
     ? sessionState
     : await getSessionStateForTable(table);
-  if (!current || !current.sessionStartAt || current.closedAt) {
-    return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db' };
+
+  if (!current || !current.id || !current.tableId || !current.sessionStartAt || current.closedAt) {
+    return {
+      ok: false,
+      sessionStartAt: current?.sessionStartAt || null,
+      closedManually: !!closedManually,
+      mode: 'db',
+      error: 'active_session_not_found',
+      message: 'Aucune session DB active trouvée pour cette table.',
+      current: current || null,
+    };
   }
+
+  // On persiste STATUS.CLOSED même pour une anomalie.
+  // L'information d'anomalie vit dans closed_with_anomaly.
+  // Ça évite un éventuel check constraint legacy sur le champ status.
+  const persistedStatus = STATUS.CLOSED;
+  const eventStatus = closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED;
 
   const updatePayload = {
     closed_at: closedAt,
-    status: closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED,
+    status: persistedStatus,
     closed_with_anomaly: !!closedWithAnomaly,
     pos_confirmed: !!posConfirmed,
     pos_confirmed_at: posConfirmed ? (current.posConfirmedAt || closedAt) : null,
   };
 
-  // Ferme toutes les sessions encore ouvertes sur cette table.
-  // Ça évite qu'une session fantôme laissée ouverte pendant la migration garde la table active.
-  const { error } = await supabase
+  const primaryResp = await supabase
+    .from(SESSION_TABLE)
+    .update(updatePayload)
+    .eq('id', current.id)
+    .is('closed_at', null)
+    .select('id');
+
+  if (primaryResp.error) {
+    console.error(`[sessions] closeActiveSessionForTable DB update failed for ${table}:`, primaryResp.error.message || primaryResp.error);
+    return {
+      ok: false,
+      sessionStartAt: current.sessionStartAt || null,
+      closedManually: !!closedManually,
+      mode: 'db-error',
+      error: 'db_close_failed',
+      message: primaryResp.error.message || 'Impossible de clôturer la session DB active.',
+    };
+  }
+
+  const primaryUpdated = Array.isArray(primaryResp.data) ? primaryResp.data.length : 0;
+  if (primaryUpdated < 1) {
+    return {
+      ok: false,
+      sessionStartAt: current.sessionStartAt || null,
+      closedManually: !!closedManually,
+      mode: 'db-error',
+      error: 'db_session_not_closed',
+      message: 'La session DB active ciblée n’a pas été clôturée.',
+      current,
+    };
+  }
+
+  const cleanupResp = await supabase
     .from(SESSION_TABLE)
     .update(updatePayload)
     .eq('table_id', current.tableId)
-    .is('closed_at', null);
+    .is('closed_at', null)
+    .neq('id', current.id);
 
-  if (error) {
-    console.error(`[sessions] closeActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
-    return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory-fallback' };
+  if (cleanupResp.error) {
+    console.error(`[sessions] closeActiveSessionForTable cleanup warning for ${table}:`, cleanupResp.error.message || cleanupResp.error);
   }
 
   const sessionTotal = await syncSessionTotalInDb(current.id);
   await appendSessionEvent('session_closed', {
     ...current,
-    status: updatePayload.status,
+    status: eventStatus,
     posConfirmed: !!updatePayload.pos_confirmed,
     posConfirmedAt: updatePayload.pos_confirmed_at,
     closedWithAnomaly: !!updatePayload.closed_with_anomaly,
@@ -816,7 +868,7 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     staffId,
     total: sessionTotal ?? current.sessionTotal ?? null,
     metadata,
-    status: updatePayload.status,
+    status: eventStatus,
   });
 
   return {
@@ -2102,6 +2154,22 @@ function mountStaffRoutes(prefix = '') {
           ticketCount: evaluation.tableTickets.length,
         },
       });
+
+      if (!result?.ok) {
+        return res.status(409).json({
+          ok: false,
+          error: result?.error || 'close_failed',
+          message: result?.message || 'La clôture a échoué.',
+          storage: await detectTicketStorageMode(),
+          journalStorage: await detectSessionEventsStorageMode(),
+          closedAt,
+          closureType: evaluation.closureType,
+          posConfirmed: evaluation.posConfirmed,
+          reason: evaluation.reason,
+          note: evaluation.note,
+          result,
+        });
+      }
 
       res.json({
         ok: true,

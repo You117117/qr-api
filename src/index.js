@@ -594,6 +594,81 @@ async function getActiveSessionsMapFromDb() {
   return map;
 }
 
+
+
+async function getLatestSessionsMapFromDb() {
+  const mode = await detectSessionStorageMode();
+  const map = new Map();
+
+  if (mode !== 'db') {
+    Object.entries(tableState).forEach(([table, flags]) => {
+      map.set(table, {
+        id: null,
+        tenantId: null,
+        tableId: null,
+        tableCode: table,
+        closedManually: !!flags.closedManually,
+        sessionStartAt: flags.sessionStartAt || null,
+        closedAt: null,
+        status: STATUS.EMPTY,
+        posConfirmed: false,
+        posConfirmedAt: null,
+        closedWithAnomaly: false,
+        sessionTotal: null,
+        closureType: null,
+      });
+    });
+    return map;
+  }
+
+  const [sessionsResp, tables] = await Promise.all([
+    supabase
+      .from(SESSION_TABLE)
+      .select('*')
+      .order(SESSION_STARTED_AT_COLUMN, { ascending: false }),
+    getRestaurantTablesFromDb(),
+  ]);
+
+  const { data, error } = sessionsResp;
+
+  if (error) {
+    console.error('[sessions] getLatestSessionsMapFromDb fallback mémoire:', error.message || error);
+    Object.entries(tableState).forEach(([table, flags]) => {
+      map.set(table, {
+        id: null,
+        tenantId: null,
+        tableId: null,
+        tableCode: table,
+        closedManually: !!flags.closedManually,
+        sessionStartAt: flags.sessionStartAt || null,
+        closedAt: null,
+        status: STATUS.EMPTY,
+        posConfirmed: false,
+        posConfirmedAt: null,
+        closedWithAnomaly: false,
+        sessionTotal: null,
+        closureType: null,
+      });
+    });
+    return map;
+  }
+
+  const codeByTableId = new Map((tables || []).map((row) => [row.id, normalizeTableCode(row.code)]));
+
+  (data || []).forEach((row) => {
+    const tableCode = codeByTableId.get(row.table_id) || normalizeTableCode(row.table_code);
+    if (!tableCode || map.has(tableCode)) return;
+    map.set(tableCode, mapSessionRowToState(row, tableCode));
+  });
+
+  return map;
+}
+
+function isIsoInCurrentBusinessDay(isoValue) {
+  if (!isoValue) return false;
+  return String(isoValue).slice(0, 10) === getBusinessDayKey();
+}
+
 async function ensureActiveSessionForTable(tableCode, startedAt = nowIso()) {
   const table = normalizeTableCode(tableCode);
   if (!table) {
@@ -1545,21 +1620,52 @@ async function tablesPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
   const tableIds = await getRestaurantTableCodesFromDb();
-  const activeSessionsMap = await getActiveSessionsMapFromDb();
+  const [activeSessionsMap, latestSessionsMap] = await Promise.all([
+    getActiveSessionsMapFromDb(),
+    getLatestSessionsMapFromDb(),
+  ]);
 
   const raw = await Promise.all(tableIds.map(async (id) => {
     const businessState = await getTableBusinessState(id, businessDay, now, activeSessionsMap);
-    const sessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
+    const activeSessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
+    const latestSessionState = latestSessionsMap.get(id) || null;
+
+    let status = businessState.status;
+    let pending = businessState.pending;
+    let lastTicketAt = businessState.lastTicketAt;
+    let lastTicket = businessState.lastTicketSummary;
+    let cleared = !!activeSessionState.closedManually;
+    let closedManually = !!activeSessionState.closedManually;
+    let sessionStartAt = activeSessionState.sessionStartAt || null;
+
+    const noActiveSession = !(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
+    const canShowLatestClosedState = (
+      noActiveSession &&
+      latestSessionState &&
+      latestSessionState.closedAt &&
+      isIsoInCurrentBusinessDay(latestSessionState.closedAt)
+    );
+
+    if (canShowLatestClosedState) {
+      status = latestSessionState.closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED;
+      pending = 0;
+      cleared = true;
+      closedManually = true;
+      sessionStartAt = latestSessionState.sessionStartAt || null;
+      if (!lastTicketAt && latestSessionState.closedAt) {
+        lastTicketAt = latestSessionState.closedAt;
+      }
+    }
 
     return {
       id,
-      pending: businessState.pending,
-      status: businessState.status,
-      lastTicketAt: businessState.lastTicketAt,
-      lastTicket: businessState.lastTicketSummary,
-      cleared: !!sessionState.closedManually,
-      closedManually: !!sessionState.closedManually,
-      sessionStartAt: sessionState.sessionStartAt || null,
+      pending,
+      status,
+      lastTicketAt,
+      lastTicket,
+      cleared,
+      closedManually,
+      sessionStartAt,
     };
   }));
 

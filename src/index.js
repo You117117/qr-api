@@ -773,50 +773,42 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
   const current = (sessionState && sessionState.id)
     ? sessionState
     : await getSessionStateForTable(table);
-  if (!current || (!current.sessionStartAt && !current.tableId) || current.closedAt) {
+  if (!current || !current.sessionStartAt || current.closedAt) {
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db' };
   }
-
-  const effectivePosConfirmed = closedWithAnomaly ? false : !!posConfirmed;
-  const effectivePosConfirmedAt = effectivePosConfirmed ? (current.posConfirmedAt || closedAt) : null;
 
   const updatePayload = {
     closed_at: closedAt,
     status: closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED,
     closed_with_anomaly: !!closedWithAnomaly,
-    pos_confirmed: effectivePosConfirmed,
-    pos_confirmed_at: effectivePosConfirmedAt,
+    pos_confirmed: !!posConfirmed,
+    pos_confirmed_at: posConfirmed ? (current.posConfirmedAt || closedAt) : null,
   };
 
-  let updateQuery = supabase
+  // Ferme toutes les sessions encore ouvertes sur cette table.
+  // Ça évite qu'une session fantôme laissée ouverte pendant la migration garde la table active.
+  const { error } = await supabase
     .from(SESSION_TABLE)
     .update(updatePayload)
+    .eq('table_id', current.tableId)
     .is('closed_at', null);
-
-  if (current.tableId) {
-    updateQuery = updateQuery.eq('table_id', current.tableId);
-  } else if (current.id) {
-    updateQuery = updateQuery.eq('id', current.id);
-  }
-
-  const { error } = await updateQuery;
 
   if (error) {
     console.error(`[sessions] closeActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory-fallback' };
   }
 
-  const sessionTotal = current.id ? await syncSessionTotalInDb(current.id) : null;
+  const sessionTotal = await syncSessionTotalInDb(current.id);
   await appendSessionEvent('session_closed', {
     ...current,
     status: updatePayload.status,
-    posConfirmed: !!effectivePosConfirmed,
-    posConfirmedAt: effectivePosConfirmedAt,
+    posConfirmed: !!updatePayload.pos_confirmed,
+    posConfirmedAt: updatePayload.pos_confirmed_at,
     closedWithAnomaly: !!updatePayload.closed_with_anomaly,
     sessionTotal: sessionTotal ?? current.sessionTotal ?? null,
   }, table, {
     createdAt: closedAt,
-    posConfirmed: !!effectivePosConfirmed,
+    posConfirmed: !!updatePayload.pos_confirmed,
     closedWithAnomaly: !!updatePayload.closed_with_anomaly,
     reason,
     note,
@@ -834,7 +826,7 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     mode: 'db',
     closedAt,
     closureType: closedWithAnomaly ? 'anomaly' : 'normal',
-    posConfirmed: !!effectivePosConfirmed,
+    posConfirmed: !!updatePayload.pos_confirmed,
     reason: reason || null,
   };
 }
@@ -1634,15 +1626,11 @@ async function tablesPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
   const tableIds = await getRestaurantTableCodesFromDb();
-  const [activeSessionsMap, latestSessionsMap] = await Promise.all([
-    getActiveSessionsMapFromDb(),
-    getLatestSessionsMapFromDb(),
-  ]);
+  const activeSessionsMap = await getActiveSessionsMapFromDb();
 
   const raw = await Promise.all(tableIds.map(async (id) => {
     const businessState = await getTableBusinessState(id, businessDay, now, activeSessionsMap);
     const activeSessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
-    const latestSessionState = latestSessionsMap.get(id) || null;
 
     let status = businessState.status;
     let pending = businessState.pending;
@@ -1652,23 +1640,17 @@ async function tablesPayload() {
     let closedManually = !!activeSessionState.closedManually;
     let sessionStartAt = activeSessionState.sessionStartAt || null;
 
+    // Une table sans session active doit redevenir Vide dans le tableau principal.
+    // L'historique de clôture vit dans /summary, pas dans /tables.
     const noActiveSession = !(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
-    const canShowLatestClosedState = (
-      noActiveSession &&
-      latestSessionState &&
-      latestSessionState.closedAt &&
-      isIsoInCurrentBusinessDay(latestSessionState.closedAt)
-    );
-
-    if (canShowLatestClosedState) {
+    if (noActiveSession) {
       status = STATUS.EMPTY;
       pending = 0;
       cleared = true;
-      closedManually = true;
+      closedManually = false;
       sessionStartAt = null;
-      if (!lastTicketAt && latestSessionState.closedAt) {
-        lastTicketAt = latestSessionState.closedAt;
-      }
+      lastTicket = null;
+      lastTicketAt = null;
     }
 
     return {
@@ -1825,7 +1807,7 @@ async function evaluateTableClosureRequest(tableCode, body = {}) {
     ok: true,
     closureType: 'anomaly',
     closedWithAnomaly: true,
-    posConfirmed: false,
+    posConfirmed: posConfirmedFlag,
     reason: reason || 'MANUAL_ANOMALY',
     note: note || null,
     sessionState,
@@ -1842,9 +1824,7 @@ async function summaryPayload() {
     .map((group) => {
       const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
-      let status = computeSummarySessionStatus(orderedTickets, now);
-      if (orderedTickets.some((t) => !!t.closedWithException)) status = 'Anomalie pas encodé';
-      else if (closedAt) status = 'Encodée en caisse';
+      const status = computeSummarySessionStatus(orderedTickets, now);
       const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
       const closedAt = orderedTickets.reduce((latest, ticket) => {
         if (!ticket.closedAt) return latest;
@@ -1857,13 +1837,17 @@ async function summaryPayload() {
         return ticket.paidAt > latest ? ticket.paidAt : latest;
       }, null);
 
+      const summaryStatus = closedAt
+        ? (orderedTickets.some((t) => !!t.closedWithException) ? 'Anomalie pas encodé' : 'Encodée en caisse')
+        : status;
+
       return {
         id: group.id,
         table: group.table,
         sessionKey: group.sessionKey,
         sessionStartedAt: group.sessionStartedAt,
         total,
-        status,
+        status: summaryStatus,
         time: new Date(group.createdAt).toLocaleTimeString('fr-FR', {
           hour: '2-digit',
           minute: '2-digit',

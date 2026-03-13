@@ -7,6 +7,7 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
 const express = require('express');
+const { randomUUID } = require('crypto');
 const cors = require('cors');
 const qrRouter = require('./qr');
 
@@ -19,6 +20,13 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+app.use((req, res, next) => {
+  const requestId = randomUUID();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
 
 app.get('/debug/tenants', async (req, res) => {
   try {
@@ -98,18 +106,43 @@ app.get('/debug/orders', async (_req, res) => {
     app.post('/session/start', async (req, res) => {
       try {
         const table = normalizeTableCode(req.body?.table || '');
-        if (!table) return res.json({ ok: true });
+        if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.'));
 
         const session = await ensureActiveSessionForTable(table, nowIso());
+
+        await appendTenantEvent({
+          tenantId: session?.tenantId || null,
+          tableId: session?.tableId || null,
+          tableCode: table,
+          sessionId: session?.id || null,
+          eventType: 'session',
+          eventCode: DIAG_EVENT.SESSION_STARTED,
+          severity: DIAG_SEVERITY.INFO,
+          message: 'Session active assurée pour la table.',
+          source: DIAG_SOURCE.CLIENT,
+          requestId: req.requestId,
+          payload: {
+            status: session?.status || null,
+            sessionStartAt: session?.sessionStartAt || null,
+          },
+        });
 
         return res.json({
           ok: true,
           storage: await detectTicketStorageMode(),
           sessionStartAt: session.sessionStartAt || null,
+          requestId: req.requestId,
         });
       } catch (err) {
         console.error('POST /session/start error', err);
-        return res.status(500).json({ ok: false, error: 'internal_error' });
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.INTERNAL_ERROR,
+          eventType: 'session',
+          message: safeErrorMessage(err),
+          source: DIAG_SOURCE.CLIENT,
+          payload: { endpoint: '/session/start' },
+        });
+        return res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Erreur interne pendant le démarrage de session.', { requestId: req.requestId }));
       }
     });
 
@@ -157,8 +190,51 @@ let sessionStorageModeCache = null;
 const ORDERS_TABLE = process.env.ORDERS_TABLE || 'orders';
 const ORDER_ITEMS_TABLE = process.env.ORDER_ITEMS_TABLE || 'order_items';
 const SESSION_EVENTS_TABLE = process.env.SESSION_EVENTS_TABLE || 'table_session_events';
+const TENANT_EVENTS_TABLE = process.env.TENANT_EVENTS_TABLE || 'tenant_events';
 let ticketStorageModeCache = null;
 let sessionEventsStorageModeCache = null;
+let tenantEventsStorageModeCache = null;
+
+const DIAG_SEVERITY = {
+  INFO: 'info',
+  WARN: 'warn',
+  ERROR: 'error',
+};
+
+const DIAG_EVENT = {
+  SESSION_STARTED: 'SESSION_STARTED',
+  ORDER_CREATED: 'ORDER_CREATED',
+  PRINT_TRIGGERED: 'PRINT_TRIGGERED',
+  POS_CONFIRMED: 'POS_CONFIRMED',
+  POS_CONFIRMATION_CANCELLED: 'POS_CONFIRMATION_CANCELLED',
+  SESSION_CLOSED_NORMAL: 'SESSION_CLOSED_NORMAL',
+  SESSION_CLOSED_ANOMALY: 'SESSION_CLOSED_ANOMALY',
+  CLOSURE_REJECTED: 'CLOSURE_REJECTED',
+  CANCEL_CLOSE_REJECTED: 'CANCEL_CLOSE_REJECTED',
+  HISTORY_FETCHED: 'HISTORY_FETCHED',
+  SUMMARY_FETCHED: 'SUMMARY_FETCHED',
+  MANAGER_SUMMARY_FETCHED: 'MANAGER_SUMMARY_FETCHED',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  DB_ERROR: 'DB_ERROR',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+};
+
+const DIAG_SOURCE = {
+  API: 'api',
+  STAFF: 'staff',
+  CLIENT: 'client',
+  SYSTEM: 'system',
+};
+
+const EMPTY_DIAGNOSTIC_TOTALS = {
+  total: 0,
+  infoCount: 0,
+  warnCount: 0,
+  errorCount: 0,
+  byType: {},
+  byCode: {},
+};
+
 
 function getBusinessDayRange(businessDay) {
   const start = new Date(`${businessDay}T00:00:00.000Z`);
@@ -167,6 +243,309 @@ function getBusinessDayRange(businessDay) {
   end.setUTCDate(end.getUTCDate() + 1);
   return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
+
+
+function normalizeDateKey(value, fallback = getBusinessDayKey()) {
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return fallback;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function buildDateRangeFromQuery(query = {}) {
+  const date = normalizeDateKey(query.date || query.day || '', getBusinessDayKey());
+  const startDate = normalizeDateKey(query.startDate || query.from || date, date);
+  const endDate = normalizeDateKey(query.endDate || query.to || startDate, startDate);
+  const startRange = getBusinessDayRange(startDate).startIso;
+  const endRange = getBusinessDayRange(endDate).endIso;
+  return { date, startDate, endDate, startIso: startRange, endIso: endRange };
+}
+
+function parsePositiveInt(value, fallback, { min = 0, max = null } = {}) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (Number.isNaN(parsed)) return fallback;
+  let next = parsed;
+  if (next < min) next = min;
+  if (max != null && next > max) next = max;
+  return next;
+}
+
+function safeErrorMessage(err, fallback = 'internal_error') {
+  if (!err) return fallback;
+  if (typeof err === 'string') return err;
+  return err.message || fallback;
+}
+
+function buildApiErrorResponse(code, message, extra = {}) {
+  return {
+    ok: false,
+    error: {
+      code,
+      message,
+      ...extra,
+    },
+  };
+}
+
+function computeDiagnosticTotals(items = []) {
+  const totals = {
+    total: items.length,
+    infoCount: 0,
+    warnCount: 0,
+    errorCount: 0,
+    byType: {},
+    byCode: {},
+  };
+
+  items.forEach((item) => {
+    const severity = String(item.severity || '').toLowerCase();
+    if (severity === DIAG_SEVERITY.ERROR) totals.errorCount += 1;
+    else if (severity === DIAG_SEVERITY.WARN) totals.warnCount += 1;
+    else totals.infoCount += 1;
+
+    const eventType = item.eventType || 'unknown';
+    const eventCode = item.eventCode || 'unknown';
+    totals.byType[eventType] = (totals.byType[eventType] || 0) + 1;
+    totals.byCode[eventCode] = (totals.byCode[eventCode] || 0) + 1;
+  });
+
+  return totals;
+}
+
+async function detectTenantEventsStorageMode() {
+  if (tenantEventsStorageModeCache) return tenantEventsStorageModeCache;
+  try {
+    const { error } = await supabase
+      .from(TENANT_EVENTS_TABLE)
+      .select('id', { head: true, count: 'exact' })
+      .limit(1);
+
+    if (error) {
+      console.warn(`[tenant-events] journal DB indisponible sur "${TENANT_EVENTS_TABLE}":`, error.message || error);
+      tenantEventsStorageModeCache = 'disabled';
+      return tenantEventsStorageModeCache;
+    }
+
+    tenantEventsStorageModeCache = 'db';
+    console.log(`[tenant-events] storage mode = db (${TENANT_EVENTS_TABLE})`);
+    return tenantEventsStorageModeCache;
+  } catch (err) {
+    console.warn('[tenant-events] détection impossible:', err.message || err);
+    tenantEventsStorageModeCache = 'disabled';
+    return tenantEventsStorageModeCache;
+  }
+}
+
+async function appendTenantEvent({
+  tenantId = null,
+  tableId = null,
+  tableCode = null,
+  sessionId = null,
+  ticketId = null,
+  eventType = 'system',
+  eventCode = DIAG_EVENT.INTERNAL_ERROR,
+  severity = DIAG_SEVERITY.INFO,
+  message = '',
+  source = DIAG_SOURCE.API,
+  requestId = null,
+  payload = null,
+  createdAt = null,
+} = {}) {
+  const storage = await detectTenantEventsStorageMode();
+  const normalizedTableCode = normalizeTableCode(tableCode);
+  const safePayload = payload && typeof payload === 'object' ? payload : (payload == null ? null : { value: payload });
+  const record = {
+    tenant_id: tenantId || null,
+    table_id: tableId || null,
+    table_code: normalizedTableCode || null,
+    session_id: sessionId || null,
+    ticket_id: ticketId || null,
+    event_type: String(eventType || 'system').trim(),
+    event_code: String(eventCode || DIAG_EVENT.INTERNAL_ERROR).trim(),
+    severity: String(severity || DIAG_SEVERITY.INFO).trim(),
+    message: String(message || '').trim() || null,
+    source: String(source || DIAG_SOURCE.API).trim(),
+    request_id: requestId || null,
+    payload_json: safePayload,
+    created_at: createdAt || nowIso(),
+  };
+
+  if (storage !== 'db') {
+    return { ok: false, storage, skipped: true, record };
+  }
+
+  const { error } = await supabase.from(TENANT_EVENTS_TABLE).insert(record);
+  if (error) {
+    console.error('[tenant-events] insert failed:', error.message || error, record);
+    return { ok: false, storage: 'db-error', error: error.message || String(error), record };
+  }
+
+  return { ok: true, storage: 'db' };
+}
+
+async function readTenantEventsFromDb({
+  startIso,
+  endIso,
+  tableCode = null,
+  sessionId = null,
+  severity = null,
+  eventType = null,
+  limit = 50,
+  offset = 0,
+} = {}) {
+  const storage = await detectTenantEventsStorageMode();
+  if (storage !== 'db') {
+    return { storage, items: [], meta: { count: 0, totalCount: 0, offset, limit } };
+  }
+
+  let query = supabase
+    .from(TENANT_EVENTS_TABLE)
+    .select('*', { count: 'exact' })
+    .gte('created_at', startIso)
+    .lt('created_at', endIso)
+    .order('created_at', { ascending: false });
+
+  if (tableCode) query = query.eq('table_code', normalizeTableCode(tableCode));
+  if (sessionId) query = query.eq('session_id', sessionId);
+  if (severity) query = query.eq('severity', String(severity).toLowerCase());
+  if (eventType) query = query.eq('event_type', eventType);
+  if (typeof offset === 'number' && typeof limit === 'number') {
+    query = query.range(offset, offset + Math.max(limit - 1, 0));
+  }
+
+  const { data, error, count } = await query;
+  if (error) {
+    console.error('[tenant-events] read failed:', error.message || error);
+    return {
+      storage: 'db-error',
+      items: [],
+      error: error.message || String(error),
+      meta: { count: 0, totalCount: 0, offset, limit },
+    };
+  }
+
+  const items = (data || []).map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id || null,
+    tableId: row.table_id || null,
+    tableCode: row.table_code || null,
+    sessionId: row.session_id || null,
+    ticketId: row.ticket_id || null,
+    eventType: row.event_type || null,
+    eventCode: row.event_code || null,
+    severity: row.severity || DIAG_SEVERITY.INFO,
+    message: row.message || null,
+    source: row.source || null,
+    requestId: row.request_id || null,
+    payload: row.payload_json || null,
+    createdAt: row.created_at || null,
+  }));
+
+  return {
+    storage: 'db',
+    items,
+    meta: {
+      count: items.length,
+      totalCount: typeof count === 'number' ? count : items.length,
+      offset,
+      limit,
+    },
+  };
+}
+
+async function readDiagnosticEvents({
+  date,
+  tableCode = null,
+  sessionId = null,
+  severity = null,
+  eventType = null,
+  limit = 50,
+  offset = 0,
+} = {}) {
+  const { startIso, endIso } = getBusinessDayRange(normalizeDateKey(date));
+  const tenantEvents = await readTenantEventsFromDb({ startIso, endIso, tableCode, sessionId, severity, eventType, limit, offset });
+  if (tenantEvents.storage === 'db') {
+    return {
+      ok: true,
+      storage: 'tenant-events',
+      date: normalizeDateKey(date),
+      items: tenantEvents.items,
+      meta: tenantEvents.meta,
+      totals: computeDiagnosticTotals(tenantEvents.items),
+    };
+  }
+
+  const sessionEvents = await getSessionEventsForBusinessDay(normalizeDateKey(date));
+  let items = (sessionEvents.events || []).map((row) => ({
+    id: row.id,
+    tenantId: row.tenant_id || null,
+    tableId: row.table_id || null,
+    tableCode: row.table_code || null,
+    sessionId: row.table_session_id || null,
+    ticketId: null,
+    eventType: row.event_type || null,
+    eventCode: row.event_type || 'legacy_event',
+    severity: DIAG_SEVERITY.INFO,
+    message: row.payload?.note || row.payload?.reason || row.event_type || null,
+    source: row.payload?.source || DIAG_SOURCE.SYSTEM,
+    requestId: null,
+    payload: row.payload || null,
+    createdAt: row.created_at || null,
+  }));
+
+  if (tableCode) items = items.filter((item) => item.tableCode === normalizeTableCode(tableCode));
+  if (sessionId) items = items.filter((item) => item.sessionId === sessionId);
+  if (eventType) items = items.filter((item) => item.eventType === eventType);
+  if (severity) items = items.filter((item) => item.severity === String(severity).toLowerCase());
+
+  const sliced = items.slice(offset, offset + limit);
+  return {
+    ok: true,
+    storage: sessionEvents.storage || 'session-events',
+    date: normalizeDateKey(date),
+    items: sliced,
+    meta: {
+      count: sliced.length,
+      totalCount: items.length,
+      offset,
+      limit,
+    },
+    totals: computeDiagnosticTotals(sliced),
+  };
+}
+
+async function logEndpointError(req, {
+  eventCode = DIAG_EVENT.INTERNAL_ERROR,
+  eventType = 'api_error',
+  severity = DIAG_SEVERITY.ERROR,
+  message = 'internal_error',
+  tableCode = null,
+  tableId = null,
+  tenantId = null,
+  sessionId = null,
+  ticketId = null,
+  source = DIAG_SOURCE.API,
+  payload = null,
+} = {}) {
+  await appendTenantEvent({
+    tenantId,
+    tableId,
+    tableCode,
+    sessionId,
+    ticketId,
+    eventType,
+    eventCode,
+    severity,
+    message,
+    source,
+    requestId: req?.requestId || null,
+    payload,
+    createdAt: nowIso(),
+  });
+}
+
 
 async function detectTicketStorageMode() {
   if (ticketStorageModeCache) return ticketStorageModeCache;
@@ -739,7 +1118,24 @@ async function ensureActiveSessionForTable(tableCode, startedAt = nowIso()) {
   fallback.closedManually = false;
   fallback.sessionStartAt = getSessionStartedAt(data) || startedAt;
 
-  return mapSessionRowToState(data, tableRow.code) || { ...fallback, tableCode: table };
+  const mapped = mapSessionRowToState(data, tableRow.code) || { ...fallback, tableCode: table };
+  await appendTenantEvent({
+    tenantId: mapped.tenantId || tableRow.tenant_id || null,
+    tableId: mapped.tableId || tableRow.id || null,
+    tableCode: table,
+    sessionId: mapped.id || null,
+    eventType: 'session',
+    eventCode: DIAG_EVENT.SESSION_STARTED,
+    severity: DIAG_SEVERITY.INFO,
+    message: 'Nouvelle session créée en base.',
+    source: DIAG_SOURCE.SYSTEM,
+    payload: {
+      startedAt: mapped.sessionStartAt || startedAt,
+      status: mapped.status || STATUS.EMPTY,
+    },
+  });
+
+  return mapped;
 }
 
 async function closeActiveSessionForTable(tableCode, options = {}) {
@@ -1289,8 +1685,29 @@ app.post('/orders', async (req, res) => {
   try {
     const { table, items, clientName } = req.body || {};
     const t = normalizeTableCode(table || '');
-    if (!t) return res.status(400).json({ ok: false, error: 'missing table' });
-    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: 'empty items' });
+    if (!t) {
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.VALIDATION_ERROR,
+        eventType: 'order',
+        severity: DIAG_SEVERITY.WARN,
+        message: 'Table manquante sur création de commande.',
+        source: DIAG_SOURCE.CLIENT,
+        payload: { endpoint: '/orders' },
+      });
+      return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.VALIDATION_ERROR,
+        eventType: 'order',
+        severity: DIAG_SEVERITY.WARN,
+        message: 'Commande vide refusée.',
+        tableCode: t,
+        source: DIAG_SOURCE.CLIENT,
+        payload: { endpoint: '/orders' },
+      });
+      return res.status(400).json(buildApiErrorResponse('EMPTY_ITEMS', 'Aucun article dans la commande.', { requestId: req.requestId }));
+    }
 
     const rootClientName = typeof clientName === 'string' ? clientName.trim() : '';
 
@@ -1322,12 +1739,16 @@ app.post('/orders', async (req, res) => {
 
     if (ticketStorageMode === 'db') {
       if (!session || !session.id || !session.tenantId) {
-        return res.status(409).json({
-          ok: false,
-          error: 'session_not_ready',
-          details: 'Aucune session DB active exploitable pour créer la commande.',
-          storage: 'db',
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.VALIDATION_ERROR,
+          eventType: 'order',
+          severity: DIAG_SEVERITY.ERROR,
+          message: 'Session DB non prête pour créer la commande.',
+          tableCode: t,
+          source: DIAG_SOURCE.CLIENT,
+          payload: { storage: 'db' },
         });
+        return res.status(409).json(buildApiErrorResponse('SESSION_NOT_READY', 'Aucune session DB active exploitable pour créer la commande.', { storage: 'db', requestId: req.requestId }));
       }
 
       const { data: seqRows, error: seqError } = await supabase
@@ -1339,12 +1760,17 @@ app.post('/orders', async (req, res) => {
 
       if (seqError) {
         console.error('POST /orders sequence lookup failed', seqError.message || seqError);
-        return res.status(500).json({
-          ok: false,
-          error: 'order_sequence_lookup_failed',
-          details: seqError.message || String(seqError),
-          storage: 'db',
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.DB_ERROR,
+          eventType: 'order',
+          message: seqError.message || String(seqError),
+          tableCode: t,
+          tenantId: session?.tenantId || null,
+          sessionId: session?.id || null,
+          source: DIAG_SOURCE.CLIENT,
+          payload: { step: 'sequence_lookup' },
         });
+        return res.status(500).json(buildApiErrorResponse('ORDER_SEQUENCE_LOOKUP_FAILED', seqError.message || 'Impossible de lire la séquence de commande.', { storage: 'db', requestId: req.requestId }));
       }
 
       const nextSeq = ((seqRows && seqRows[0] && seqRows[0].sequence_in_session) || 0) + 1;
@@ -1367,13 +1793,17 @@ app.post('/orders', async (req, res) => {
 
       if (orderError || !orderRow) {
         console.error('POST /orders order insert failed', orderError?.message || orderError);
-        return res.status(500).json({
-          ok: false,
-          error: 'order_insert_failed',
-          details: orderError?.message || 'order_row_missing',
-          storage: 'db',
-          payload: orderInsertPayload,
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.DB_ERROR,
+          eventType: 'order',
+          message: orderError?.message || 'order_row_missing',
+          tableCode: t,
+          tenantId: session?.tenantId || null,
+          sessionId: session?.id || null,
+          source: DIAG_SOURCE.CLIENT,
+          payload: { step: 'order_insert', payload: orderInsertPayload },
         });
+        return res.status(500).json(buildApiErrorResponse('ORDER_INSERT_FAILED', orderError?.message || 'Insertion de commande impossible.', { storage: 'db', requestId: req.requestId }));
       }
 
       const itemPayloads = normalized.map((it) => ({
@@ -1395,14 +1825,18 @@ app.post('/orders', async (req, res) => {
       if (itemError) {
         console.error('POST /orders item insert failed', itemError.message || itemError);
         await supabase.from(ORDERS_TABLE).delete().eq('id', orderRow.id);
-        return res.status(500).json({
-          ok: false,
-          error: 'order_items_insert_failed',
-          details: itemError.message || String(itemError),
-          storage: 'db',
-          orderId: orderRow.id,
-          itemPayloads,
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.DB_ERROR,
+          eventType: 'order',
+          message: itemError.message || String(itemError),
+          tableCode: t,
+          tenantId: session?.tenantId || null,
+          sessionId: session?.id || null,
+          ticketId: orderRow.id,
+          source: DIAG_SOURCE.CLIENT,
+          payload: { step: 'order_items_insert', itemPayloadsCount: itemPayloads.length },
         });
+        return res.status(500).json(buildApiErrorResponse('ORDER_ITEMS_INSERT_FAILED', itemError.message || 'Insertion des lignes impossible.', { storage: 'db', orderId: orderRow.id, requestId: req.requestId }));
       }
 
       const ticket = mapDbRowsToTicket(
@@ -1423,10 +1857,32 @@ app.post('/orders', async (req, res) => {
       await syncSessionTotalInDb(session.id);
       try { delete carts[t]; } catch (e) {}
 
+      await appendTenantEvent({
+        tenantId: session.tenantId,
+        tableId: session.tableId,
+        tableCode: t,
+        sessionId: session.id,
+        ticketId: orderRow.id,
+        eventType: 'order',
+        eventCode: DIAG_EVENT.ORDER_CREATED,
+        severity: DIAG_SEVERITY.INFO,
+        message: `Commande créée (${normalized.length} ligne(s)).`,
+        source: DIAG_SOURCE.CLIENT,
+        requestId: req.requestId,
+        payload: {
+          storage: 'db',
+          sequenceInSession: nextSeq,
+          total: ticket.total,
+          itemsCount: normalized.length,
+          clientName: rootClientName || null,
+        },
+      });
+
       return res.json({
         ok: true,
         storage: 'db',
         ticket,
+        requestId: req.requestId,
       });
     }
 
@@ -1451,10 +1907,35 @@ app.post('/orders', async (req, res) => {
     tickets.push(ticket);
 
     try { delete carts[t]; } catch (e) {}
-    return res.json({ ok: true, storage: 'memory', ticket });
+    await appendTenantEvent({
+      tenantId: session?.tenantId || null,
+      tableId: session?.tableId || null,
+      tableCode: t,
+      sessionId: session?.id || null,
+      ticketId: ticket.id,
+      eventType: 'order',
+      eventCode: DIAG_EVENT.ORDER_CREATED,
+      severity: DIAG_SEVERITY.INFO,
+      message: `Commande créée en mémoire (${normalized.length} ligne(s)).`,
+      source: DIAG_SOURCE.CLIENT,
+      requestId: req.requestId,
+      payload: {
+        storage: 'memory',
+        total,
+        itemsCount: normalized.length,
+      },
+    });
+    return res.json({ ok: true, storage: 'memory', ticket, requestId: req.requestId });
   } catch (err) {
     console.error('POST /orders error', err);
-    return res.status(500).json({ ok: false, error: 'internal_error', details: err.message || String(err) });
+    await logEndpointError(req, {
+      eventCode: DIAG_EVENT.INTERNAL_ERROR,
+      eventType: 'order',
+      message: safeErrorMessage(err),
+      source: DIAG_SOURCE.CLIENT,
+      payload: { endpoint: '/orders' },
+    });
+    return res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Erreur interne pendant la création de commande.', { details: err.message || String(err), requestId: req.requestId }));
   }
 });
 
@@ -1868,105 +2349,85 @@ async function evaluateTableClosureRequest(tableCode, body = {}) {
   };
 }
 
-function formatTimeLabel(isoValue) {
-  if (!isoValue) return '--:--';
-  const dt = new Date(isoValue);
-  if (Number.isNaN(dt.getTime())) return '--:--';
-  return dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
-}
 
-function computeDurationSeconds(startedAt, endedAt = null) {
-  if (!startedAt) return null;
-  const startTs = new Date(startedAt).getTime();
-  const endTs = endedAt ? new Date(endedAt).getTime() : Date.now();
-  if (Number.isNaN(startTs) || Number.isNaN(endTs) || endTs < startTs) return null;
-  return Math.round((endTs - startTs) / 1000);
-}
-
-function mapHistoryDisplayStatus({ sessionRow, orderedTickets, now = new Date() }) {
-  const closedAt = sessionRow?.closedAt || null;
-  const closedWithAnomaly = !!sessionRow?.closedWithAnomaly;
-
-  if (closedAt) {
-    return {
-      stateKind: closedWithAnomaly ? 'closed_anomaly' : 'closed_normal',
-      status: closedWithAnomaly ? 'Anomalie pas encodé' : 'Encodée en caisse',
-      closureType: closedWithAnomaly ? 'anomaly' : 'normal',
-    };
-  }
-
-  const activeStatus = computeSummarySessionStatus(orderedTickets, now);
-  return {
-    stateKind: 'active',
-    status: activeStatus,
-    closureType: 'active',
-  };
-}
-
-function buildHistoryItem({ sessionRow, orderedTickets, tableMeta, now = new Date() }) {
-  const tickets = Array.isArray(orderedTickets)
-    ? [...orderedTickets].sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
-    : [];
-
-  const startedAt = sessionRow?.sessionStartAt || sessionRow?.openedAt || (tickets[0]?.sessionStartedAt || tickets[0]?.createdAt || null);
-  const closedAt = sessionRow?.closedAt || tickets.reduce((latest, ticket) => {
+function mapSessionGroupToHistoryItem(group, now = new Date()) {
+  const orderedTickets = [...(group.tickets || [])].sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+  const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
+  const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
+  const closedAt = orderedTickets.reduce((latest, ticket) => {
     if (!ticket.closedAt) return latest;
     if (!latest) return ticket.closedAt;
     return ticket.closedAt > latest ? ticket.closedAt : latest;
   }, null);
-  const paidAt = sessionRow?.posConfirmedAt || tickets.reduce((latest, ticket) => {
+  const paidAt = orderedTickets.reduce((latest, ticket) => {
     if (!ticket.paidAt) return latest;
     if (!latest) return ticket.paidAt;
     return ticket.paidAt > latest ? ticket.paidAt : latest;
   }, null);
-  const sessionTotal = typeof sessionRow?.sessionTotal === 'number'
-    ? sessionRow.sessionTotal
-    : tickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
-  const total = Math.round((Number(sessionTotal || 0) + Number.EPSILON) * 100) / 100;
-  const durationSeconds = computeDurationSeconds(startedAt, closedAt || null);
-  const itemsCount = tickets.reduce((sum, ticket) => {
-    const list = Array.isArray(ticket.items) ? ticket.items : [];
-    return sum + list.reduce((acc, item) => acc + Number(item.qty || item.quantity || 0), 0);
-  }, 0);
-  const display = mapHistoryDisplayStatus({ sessionRow, orderedTickets: tickets, now });
+
+  const sessionState = {
+    sessionStartAt: group.sessionStartedAt || (orderedTickets[0]?.sessionStartedAt || null),
+    closedAt: closedAt || null,
+  };
+
+  const liveStatus = deriveSessionBusinessState({
+    sessionState,
+    sessionTickets: orderedTickets,
+    now,
+  }).status;
+
+  const closureType = orderedTickets.some((t) => !!t.closedWithException)
+    ? 'anomaly'
+    : (closedAt ? 'normal' : 'active');
+
+  const displayStatus = closureType === 'normal'
+    ? 'Encodée en caisse'
+    : closureType === 'anomaly'
+      ? 'Anomalie pas encodé'
+      : liveStatus;
+
+  const startedAt = group.sessionStartedAt || orderedTickets[0]?.sessionStartedAt || orderedTickets[0]?.createdAt || null;
+  const durationSeconds = startedAt
+    ? Math.max(0, Math.round(((closedAt ? new Date(closedAt) : now).getTime() - new Date(startedAt).getTime()) / 1000))
+    : 0;
 
   return {
-    id: sessionRow?.id || `${tableMeta?.code || sessionRow?.tableCode || 'TABLE'}__${startedAt || tickets[0]?.createdAt || nowIso()}`,
-    sessionId: sessionRow?.id || null,
-    tenantId: sessionRow?.tenantId || tableMeta?.tenant_id || null,
-    tableId: sessionRow?.tableId || tableMeta?.id || null,
-    table: tableMeta?.code || sessionRow?.tableCode || null,
-    tableLabel: tableMeta?.label || tableMeta?.code || sessionRow?.tableCode || null,
-    sessionKey: startedAt || sessionRow?.sessionStartAt || null,
+    id: group.id,
+    sessionId: group.sessionId || group.sessionKey || group.id,
+    tenantId: group.tenantId || null,
+    tableId: group.tableId || null,
+    table: group.table,
+    tableLabel: group.tableLabel || group.table,
+    sessionKey: group.sessionKey,
     sessionStartedAt: startedAt,
     openedAt: startedAt,
     closedAt: closedAt || null,
     paidAt: paidAt || null,
-    updatedAt: closedAt || paidAt || tickets[tickets.length - 1]?.createdAt || startedAt || null,
-    createdAt: startedAt || tickets[0]?.createdAt || null,
+    total: Math.round(total * 100) / 100,
+    itemsCount: orderedTickets.reduce((sum, ticket) => sum + (Array.isArray(ticket.items) ? ticket.items.reduce((s, item) => s + Number(item.qty || 0), 0) : 0), 0),
+    ordersCount: orderedTickets.length,
+    hasOrders: orderedTickets.length > 0,
+    stateKind: closureType === 'active' ? 'active' : (closureType === 'anomaly' ? 'closed_anomaly' : 'closed_normal'),
+    status: displayStatus,
+    displayStatus,
+    closureType,
+    cashRegisterConfirmed: closureType === 'normal',
+    posConfirmed: closureType === 'normal',
+    posConfirmedAt: paidAt || null,
+    closedWithAnomaly: closureType === 'anomaly',
     durationSeconds,
-    total,
-    ordersCount: tickets.length,
-    itemsCount,
-    hasOrders: tickets.length > 0,
-    stateKind: display.stateKind,
-    status: display.status,
-    displayStatus: display.status,
-    closureType: display.closureType,
-    cashRegisterConfirmed: !!sessionRow?.posConfirmed,
-    posConfirmed: !!sessionRow?.posConfirmed,
-    posConfirmedAt: sessionRow?.posConfirmedAt || null,
-    closedWithAnomaly: !!sessionRow?.closedWithAnomaly,
-    time: formatTimeLabel(startedAt),
-    openedTime: formatTimeLabel(startedAt),
-    closedTime: closedAt ? formatTimeLabel(closedAt) : '--:--',
-    tickets: tickets.map((t) => ({
+    time: startedAt ? new Date(startedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null,
+    openTime: startedAt ? new Date(startedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null,
+    closedTime: closedAt ? new Date(closedAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null,
+    createdAt: group.createdAt,
+    updatedAt: group.updatedAt,
+    tickets: orderedTickets.map((t) => ({
       id: t.id,
       table: t.table,
       total: t.total,
       items: t.items,
       clientName: t.clientName || null,
-      time: formatTimeLabel(t.createdAt),
+      time: new Date(t.createdAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
       createdAt: t.createdAt,
       printedAt: t.printedAt || null,
       paidAt: t.paidAt || null,
@@ -1975,160 +2436,164 @@ function buildHistoryItem({ sessionRow, orderedTickets, tableMeta, now = new Dat
       posConfirmed: typeof t.posConfirmed === 'boolean' ? t.posConfirmed : null,
       closedWithException: !!t.closedWithException,
       exceptionReason: t.exceptionReason || null,
-      sessionKey: t.sessionKey || startedAt,
-      sessionStartedAt: t.sessionStartedAt || startedAt,
+      sessionKey: t.sessionKey || group.sessionKey,
+      sessionStartedAt: t.sessionStartedAt || group.sessionStartedAt,
     })),
+    lastTicketId: lastTicket ? lastTicket.id : null,
   };
 }
 
-async function buildHistoricalSessions({
-  businessDay = getBusinessDayKey(),
-  tableCode = null,
+function buildSummaryTotals(items = []) {
+  const grossTotal = items.reduce((sum, item) => sum + Number(item.total || 0), 0);
+  const sessionsCount = items.length;
+  const closedNormalCount = items.filter((item) => item.closureType === 'normal').length;
+  const closedAnomalyCount = items.filter((item) => item.closureType === 'anomaly').length;
+  const activeCount = items.filter((item) => item.closureType === 'active').length;
+  const averageBasket = sessionsCount ? Math.round((grossTotal / sessionsCount) * 100) / 100 : 0;
+  const durationValues = items.map((item) => Number(item.durationSeconds || 0)).filter((value) => value > 0);
+  const averageDurationSeconds = durationValues.length
+    ? Math.round(durationValues.reduce((sum, value) => sum + value, 0) / durationValues.length)
+    : 0;
+
+  return {
+    sessionsCount,
+    activeCount,
+    closedNormalCount,
+    closedAnomalyCount,
+    grossTotal: Math.round(grossTotal * 100) / 100,
+    averageBasket,
+    averageDurationSeconds,
+  };
+}
+
+async function buildHistoryPayload({
+  date = getBusinessDayKey(),
+  tableId = null,
   closureType = 'all',
-  includeActive = true,
+  includeActive = false,
   limit = null,
   offset = 0,
 } = {}) {
-  const normalizedTable = normalizeTableCode(tableCode);
-  const requestedClosureType = String(closureType || 'all').trim().toLowerCase();
+  const dateKey = normalizeDateKey(date);
   const now = new Date();
-  const tables = await getRestaurantTablesFromDb();
-  const tableById = new Map((tables || []).map((row) => [row.id, row]));
-  const tableByCode = new Map((tables || []).map((row) => [normalizeTableCode(row.code), row]));
-  const { startIso, endIso } = getBusinessDayRange(businessDay);
+  const groups = await groupTicketsBySessionForDay(dateKey);
+  let items = groups.map((group) => mapSessionGroupToHistoryItem(group, now));
 
-  let sessionRows = [];
-  if ((await detectSessionStorageMode()) === 'db') {
-    let query = supabase
-      .from(SESSION_TABLE)
-      .select('*')
-      .gte(SESSION_STARTED_AT_COLUMN, startIso)
-      .lt(SESSION_STARTED_AT_COLUMN, endIso)
-      .order(SESSION_STARTED_AT_COLUMN, { ascending: false });
-
-    if (normalizedTable) {
-      const tableMeta = tableByCode.get(normalizedTable);
-      if (tableMeta?.id) {
-        query = query.eq('table_id', tableMeta.id);
-      } else {
-        query = query.eq('table_code', normalizedTable);
-      }
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-    sessionRows = Array.isArray(data) ? data.map((row) => {
-      const tableMeta = tableById.get(row.table_id) || tableByCode.get(normalizeTableCode(row.table_code));
-      return {
-        raw: row,
-        mapped: mapSessionRowToState(row, tableMeta?.code || row.table_code || null),
-        tableMeta: tableMeta || null,
-      };
-    }) : [];
+  const normalizedTable = normalizeTableCode(tableId);
+  if (normalizedTable) {
+    items = items.filter((item) => normalizeTableCode(item.table) === normalizedTable);
   }
 
-  const allTickets = await listTicketsForBusinessDayFromDb(businessDay);
-  const ticketsByGroupKey = new Map();
-  (Array.isArray(allTickets) ? allTickets : []).forEach((ticket) => {
-    const ticketTable = normalizeTableCode(ticket.table);
-    if (normalizedTable && ticketTable !== normalizedTable) return;
-    const sessionKey = ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt || `${ticketTable}-${ticket.id}`;
-    const groupKey = `${ticketTable}__${sessionKey}`;
-    if (!ticketsByGroupKey.has(groupKey)) ticketsByGroupKey.set(groupKey, []);
-    ticketsByGroupKey.get(groupKey).push(ticket);
+  const normalizedClosureType = String(closureType || 'all').trim().toLowerCase();
+  if (normalizedClosureType === 'normal') items = items.filter((item) => item.closureType === 'normal');
+  if (normalizedClosureType === 'anomaly') items = items.filter((item) => item.closureType === 'anomaly');
+  if (normalizedClosureType === 'active') items = items.filter((item) => item.closureType === 'active');
+  if (!includeActive && normalizedClosureType !== 'active') items = items.filter((item) => item.closureType !== 'active');
+
+  items.sort((a, b) => {
+    const aTs = new Date(a.closedAt || a.updatedAt || a.createdAt || 0).getTime();
+    const bTs = new Date(b.closedAt || b.updatedAt || b.createdAt || 0).getTime();
+    return bTs - aTs;
   });
 
-  const items = sessionRows
-    .map(({ mapped, tableMeta }) => {
-      const tableCodeSafe = normalizeTableCode(mapped.tableCode || tableMeta?.code);
-      const sessionKey = mapped.sessionStartAt || mapped.closedAt || null;
-      const groupKey = `${tableCodeSafe}__${sessionKey}`;
-      const orderedTickets = ticketsByGroupKey.get(groupKey) || [];
-      return buildHistoryItem({ sessionRow: mapped, orderedTickets, tableMeta, now });
-    })
-    .filter((item) => {
-      if (!includeActive && item.stateKind === 'active') return false;
-      if (requestedClosureType === 'all') return true;
-      if (requestedClosureType === 'normal') return item.closureType === 'normal';
-      if (requestedClosureType === 'anomaly') return item.closureType === 'anomaly';
-      if (requestedClosureType === 'active') return item.stateKind === 'active';
-      return true;
-    })
-    .filter((item) => {
-      if (normalizedTable && normalizeTableCode(item.table) !== normalizedTable) return false;
-      if (item.stateKind === 'active') return true;
-      return item.hasOrders;
-    })
-    .sort((a, b) => {
-      const aTs = new Date(a.closedAt || a.openedAt || a.createdAt || 0).getTime();
-      const bTs = new Date(b.closedAt || b.openedAt || b.createdAt || 0).getTime();
-      if (!Number.isNaN(aTs) && !Number.isNaN(bTs)) return bTs - aTs;
-      return String(b.closedAt || b.openedAt || b.createdAt || '').localeCompare(String(a.closedAt || a.openedAt || a.createdAt || ''));
-    });
-
-  const safeOffset = Math.max(0, Number(offset || 0) || 0);
-  const safeLimit = limit == null ? null : Math.max(0, Number(limit || 0) || 0);
-  const paged = safeLimit ? items.slice(safeOffset, safeOffset + safeLimit) : items.slice(safeOffset);
+  const totalCount = items.length;
+  const safeOffset = parsePositiveInt(offset, 0, { min: 0 });
+  const safeLimit = limit == null ? null : parsePositiveInt(limit, 50, { min: 1, max: 500 });
+  if (safeLimit != null) {
+    items = items.slice(safeOffset, safeOffset + safeLimit);
+  } else if (safeOffset > 0) {
+    items = items.slice(safeOffset);
+  }
 
   return {
-    businessDay,
-    items: paged,
+    ok: true,
+    date: dateKey,
+    filters: {
+      tableId: normalizedTable || null,
+      closureType: normalizedClosureType,
+      includeActive: !!includeActive,
+    },
+    items,
+    totals: buildSummaryTotals(items),
     meta: {
-      count: paged.length,
-      totalCount: items.length,
+      count: items.length,
+      totalCount,
       offset: safeOffset,
       limit: safeLimit,
     },
   };
 }
 
-function computeSummaryTotals(items = []) {
-  const totals = {
-    sessionsCount: items.length,
-    activeCount: 0,
-    closedNormalCount: 0,
-    closedAnomalyCount: 0,
-    grossTotal: 0,
-    averageBasket: 0,
-    averageDurationSeconds: 0,
-  };
-
-  let durationCount = 0;
-  items.forEach((item) => {
-    if (item.stateKind === 'active') totals.activeCount += 1;
-    if (item.closureType === 'normal') totals.closedNormalCount += 1;
-    if (item.closureType === 'anomaly') totals.closedAnomalyCount += 1;
-    totals.grossTotal += Number(item.total || 0);
-    if (typeof item.durationSeconds === 'number') {
-      totals.averageDurationSeconds += item.durationSeconds;
-      durationCount += 1;
-    }
-  });
-
-  totals.grossTotal = Math.round((totals.grossTotal + Number.EPSILON) * 100) / 100;
-  totals.averageBasket = items.length ? Math.round(((totals.grossTotal / items.length) + Number.EPSILON) * 100) / 100 : 0;
-  totals.averageDurationSeconds = durationCount ? Math.round(totals.averageDurationSeconds / durationCount) : 0;
-
-  return totals;
-}
-
 async function summaryPayload() {
-  const businessDay = getBusinessDayKey();
-  const history = await buildHistoricalSessions({
-    businessDay,
+  const history = await buildHistoryPayload({
+    date: getBusinessDayKey(),
     closureType: 'all',
     includeActive: true,
+    limit: null,
+    offset: 0,
   });
 
+  const items = history.items || [];
   return {
     ok: true,
-    date: businessDay,
-    totals: computeSummaryTotals(history.items),
-    items: history.items,
-    tickets: history.items,
+    date: history.date,
+    totals: buildSummaryTotals(items),
+    items,
+    tickets: items,
     meta: history.meta,
   };
 }
+
+async function managerSummaryPayload(query = {}) {
+  const dateKey = normalizeDateKey(query.date || query.day || '');
+  const history = await buildHistoryPayload({
+    date: dateKey,
+    closureType: query.closureType || 'all',
+    includeActive: true,
+    limit: null,
+    offset: 0,
+    tableId: query.tableId || null,
+  });
+
+  const items = history.items || [];
+  const byTableMap = new Map();
+  items.forEach((item) => {
+    const key = normalizeTableCode(item.table) || 'UNKNOWN';
+    if (!byTableMap.has(key)) {
+      byTableMap.set(key, {
+        table: key,
+        sessionsCount: 0,
+        grossTotal: 0,
+        anomaliesCount: 0,
+        activeCount: 0,
+        averageBasket: 0,
+      });
+    }
+    const row = byTableMap.get(key);
+    row.sessionsCount += 1;
+    row.grossTotal += Number(item.total || 0);
+    if (item.closureType === 'anomaly') row.anomaliesCount += 1;
+    if (item.closureType === 'active') row.activeCount += 1;
+  });
+
+  const byTable = Array.from(byTableMap.values())
+    .map((row) => ({
+      ...row,
+      grossTotal: Math.round(row.grossTotal * 100) / 100,
+      averageBasket: row.sessionsCount ? Math.round((row.grossTotal / row.sessionsCount) * 100) / 100 : 0,
+    }))
+    .sort((a, b) => b.grossTotal - a.grossTotal);
+
+  return {
+    ok: true,
+    date: history.date,
+    totals: buildSummaryTotals(items),
+    byTable,
+    recentSessions: items.slice(0, 10),
+    meta: history.meta,
+  };
+}
+
 // ---- Montage des routes Staff (root + /staff pour compatibilité) ----
 
 function mountStaffRoutes(prefix = '') {
@@ -2138,60 +2603,142 @@ function mountStaffRoutes(prefix = '') {
       res.json(await tablesPayload());
     } catch (err) {
       console.error('GET /tables error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'confirm',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/confirm` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de confirmer l encodage caisse.', { requestId: req.requestId }));
     }
   });
 
   // GET summary
-  app.get(prefix + '/summary', async (_req, res) => {
+  app.get(prefix + '/summary', async (req, res) => {
     try {
-      res.json(await summaryPayload());
+      const payload = await summaryPayload();
+      await appendTenantEvent({
+        eventType: 'summary',
+        eventCode: DIAG_EVENT.SUMMARY_FETCHED,
+        severity: DIAG_SEVERITY.INFO,
+        message: 'Resume du jour consulte.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
+        payload: { count: payload.meta?.count || 0 },
+      });
+      res.json(payload);
     } catch (err) {
       console.error('GET /summary error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'summary',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/summary` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de construire le resume du jour.', { requestId: req.requestId }));
     }
   });
 
-  // GET history-sessions
+  // GET history sessions
   app.get(prefix + '/history-sessions', async (req, res) => {
     try {
-      const businessDay = String(req.query?.date || getBusinessDayKey()).trim() || getBusinessDayKey();
-      const tableCode = String(req.query?.tableId || req.query?.table || '').trim() || null;
-      const closureType = String(req.query?.closureType || 'all').trim().toLowerCase() || 'all';
-      const includeActive = String(req.query?.includeActive || '').trim().toLowerCase() === 'true' || closureType === 'active';
-      const limitRaw = req.query?.limit;
-      const offsetRaw = req.query?.offset;
-      const history = await buildHistoricalSessions({
-        businessDay,
-        tableCode,
-        closureType,
-        includeActive,
-        limit: limitRaw == null ? null : Number(limitRaw),
-        offset: offsetRaw == null ? 0 : Number(offsetRaw),
+      const payload = await buildHistoryPayload({
+        date: req.query?.date || getBusinessDayKey(),
+        tableId: req.query?.tableId || null,
+        closureType: req.query?.closureType || 'all',
+        includeActive: String(req.query?.closureType || '').toLowerCase() === 'active' || String(req.query?.includeActive || '').toLowerCase() === 'true',
+        limit: req.query?.limit ? parsePositiveInt(req.query.limit, 100, { min: 1, max: 500 }) : null,
+        offset: parsePositiveInt(req.query?.offset, 0, { min: 0 }),
       });
-
-      res.json({
-        ok: true,
-        date: history.businessDay,
-        filters: {
-          tableId: tableCode,
-          closureType,
-          includeActive,
-        },
-        items: history.items,
-        meta: history.meta,
-      });
+      res.json(payload);
     } catch (err) {
       console.error('GET /history-sessions error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'history',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/history-sessions` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de lire l historique des sessions.', { requestId: req.requestId }));
+    }
+  });
+
+  // GET manager summary
+  app.get(prefix + '/manager-summary', async (req, res) => {
+    try {
+      const payload = await managerSummaryPayload(req.query || {});
+      await appendTenantEvent({
+        eventType: 'manager_summary',
+        eventCode: DIAG_EVENT.MANAGER_SUMMARY_FETCHED,
+        severity: DIAG_SEVERITY.INFO,
+        message: 'Reporting manager consulte.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
+        payload: { date: payload.date, sessionsCount: payload.totals?.sessionsCount || 0 },
+      });
+      res.json(payload);
+    } catch (err) {
+      console.error('GET /manager-summary error', err);
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'manager_summary',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/manager-summary` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de construire le reporting manager.', { requestId: req.requestId }));
+    }
+  });
+
+  // GET diagnostic events
+  app.get(prefix + '/diagnostic/events', async (req, res) => {
+    try {
+      const payload = await readDiagnosticEvents({
+        date: req.query?.date || getBusinessDayKey(),
+        tableCode: req.query?.tableId || req.query?.table || null,
+        sessionId: req.query?.sessionId || null,
+        severity: req.query?.severity || null,
+        eventType: req.query?.eventType || null,
+        limit: parsePositiveInt(req.query?.limit, 50, { min: 1, max: 200 }),
+        offset: parsePositiveInt(req.query?.offset, 0, { min: 0 }),
+      });
+      res.json(payload);
+    } catch (err) {
+      console.error('GET /diagnostic/events error', err);
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de lire les evenements de diagnostic.', { requestId: req.requestId }));
+    }
+  });
+
+  // GET diagnostic overview
+  app.get(prefix + '/diagnostic/overview', async (req, res) => {
+    try {
+      const eventsPayload = await readDiagnosticEvents({
+        date: req.query?.date || getBusinessDayKey(),
+        limit: parsePositiveInt(req.query?.limit, 100, { min: 1, max: 500 }),
+      });
+      const recentErrors = (eventsPayload.items || []).filter((item) => item.severity === DIAG_SEVERITY.ERROR).slice(0, 10);
+      res.json({
+        ok: true,
+        date: eventsPayload.date,
+        storage: eventsPayload.storage,
+        totals: eventsPayload.totals || EMPTY_DIAGNOSTIC_TOTALS,
+        recentErrors,
+        meta: eventsPayload.meta,
+      });
+    } catch (err) {
+      console.error('GET /diagnostic/overview error', err);
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de construire le diagnostic.', { requestId: req.requestId }));
     }
   });
 
   // POST print
   app.post(prefix + '/print', async (req, res) => {
     try {
-      const table = String(req.body?.table || '').trim();
-      if (!table) return res.json({ ok: true });
+      const table = normalizeTableCode(req.body?.table || '');
+      if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
 
       const businessDay = getBusinessDayKey();
       const last = await lastTicketForTable(table, businessDay);
@@ -2202,12 +2749,30 @@ function mountStaffRoutes(prefix = '') {
         } else {
           last.printedAt = stamp;
         }
+        await appendTenantEvent({
+          tableCode: table,
+          ticketId: last.id,
+          eventType: 'print',
+          eventCode: DIAG_EVENT.PRINT_TRIGGERED,
+          severity: DIAG_SEVERITY.INFO,
+          message: 'Impression employeee sur le dernier ticket.',
+          source: DIAG_SOURCE.STAFF,
+          requestId: req.requestId,
+          payload: { printedAt: stamp },
+        });
       }
 
-      res.json({ ok: true });
+      res.json({ ok: true, requestId: req.requestId });
     } catch (err) {
       console.error('POST /print error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'print',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/print` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de marquer le ticket comme imprime.', { requestId: req.requestId }));
     }
   });
 
@@ -2215,12 +2780,20 @@ function mountStaffRoutes(prefix = '') {
   app.post(prefix + '/confirm', async (req, res) => {
     try {
       const table = normalizeTableCode(req.body?.table || '');
-      if (!table) return res.json({ ok: true });
+      if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
 
       const now = nowIso();
       const sessionState = await getSessionStateForTable(table);
       if (!sessionState || !sessionState.sessionStartAt || sessionState.closedAt) {
-        return res.status(409).json({ ok: false, error: 'no_active_session', message: 'Aucune session active à confirmer.' });
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.CLOSURE_REJECTED,
+          eventType: 'confirm',
+          severity: DIAG_SEVERITY.WARN,
+          message: 'Confirmation caisse refusee sans session active.',
+          tableCode: table,
+          source: DIAG_SOURCE.STAFF,
+        });
+        return res.status(409).json(buildApiErrorResponse('NO_ACTIVE_SESSION', 'Aucune session active a confirmer.', { requestId: req.requestId }));
       }
 
       if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
@@ -2260,10 +2833,30 @@ function mountStaffRoutes(prefix = '') {
         total: sessionState.sessionTotal ?? null,
       });
 
-      res.json({ ok: true, storage: await detectSessionStorageMode(), confirmedAt: now, journalStorage: await detectSessionEventsStorageMode() });
+      await appendTenantEvent({
+        tenantId: sessionState?.tenantId || null,
+        tableId: sessionState?.tableId || null,
+        tableCode: table,
+        sessionId: sessionState?.id || null,
+        eventType: 'pos_confirmation',
+        eventCode: DIAG_EVENT.POS_CONFIRMED,
+        severity: DIAG_SEVERITY.INFO,
+        message: 'Encodage caisse confirme.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
+        payload: { confirmedAt: now },
+      });
+      res.json({ ok: true, storage: await detectSessionStorageMode(), confirmedAt: now, journalStorage: await detectSessionEventsStorageMode(), requestId: req.requestId });
     } catch (err) {
       console.error('POST /confirm error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'confirm',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/confirm` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de confirmer l encodage caisse.', { requestId: req.requestId }));
     }
   });
 
@@ -2271,11 +2864,19 @@ function mountStaffRoutes(prefix = '') {
   app.post(prefix + '/cancel-confirm', async (req, res) => {
     try {
       const table = normalizeTableCode(req.body?.table || '');
-      if (!table) return res.json({ ok: true });
+      if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
 
       const sessionState = await getSessionStateForTable(table);
       if (!sessionState || !sessionState.sessionStartAt || sessionState.closedAt) {
-        return res.status(409).json({ ok: false, error: 'no_active_session', message: 'Aucune session active à rouvrir.' });
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.CLOSURE_REJECTED,
+          eventType: 'cancel_confirm',
+          severity: DIAG_SEVERITY.WARN,
+          message: 'Annulation de confirmation refusee sans session active.',
+          tableCode: table,
+          source: DIAG_SOURCE.STAFF,
+        });
+        return res.status(409).json(buildApiErrorResponse('NO_ACTIVE_SESSION', 'Aucune session active a rouvrir.', { requestId: req.requestId }));
       }
 
       if (sessionState && sessionState.id && (await detectSessionStorageMode()) === 'db') {
@@ -2315,10 +2916,29 @@ function mountStaffRoutes(prefix = '') {
         total: sessionState.sessionTotal ?? null,
       });
 
-      res.json({ ok: true, storage: await detectSessionStorageMode(), journalStorage: await detectSessionEventsStorageMode() });
+      await appendTenantEvent({
+        tenantId: sessionState?.tenantId || null,
+        tableId: sessionState?.tableId || null,
+        tableCode: table,
+        sessionId: sessionState?.id || null,
+        eventType: 'pos_confirmation',
+        eventCode: DIAG_EVENT.POS_CONFIRMATION_CANCELLED,
+        severity: DIAG_SEVERITY.WARN,
+        message: 'Encodage caisse annule.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
+      });
+      res.json({ ok: true, storage: await detectSessionStorageMode(), journalStorage: await detectSessionEventsStorageMode(), requestId: req.requestId });
     } catch (err) {
       console.error('POST /cancel-confirm error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'cancel_confirm',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/cancel-confirm` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible d annuler l encodage caisse.', { requestId: req.requestId }));
     }
   });
 
@@ -2326,17 +2946,31 @@ function mountStaffRoutes(prefix = '') {
   app.post(prefix + '/close-table', async (req, res) => {
     try {
       const table = normalizeTableCode(req.body?.table || '');
-      if (!table) return res.json({ ok: true });
+      if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
 
       const evaluation = await evaluateTableClosureRequest(table, req.body || {});
       if (!evaluation.ok) {
-        return res.status(evaluation.httpStatus || 409).json({
-          ok: false,
-          error: evaluation.code,
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.CLOSURE_REJECTED,
+          eventType: 'close_table',
+          severity: DIAG_SEVERITY.WARN,
           message: evaluation.message,
+          tableCode: table,
+          tenantId: evaluation.sessionState?.tenantId || null,
+          tableId: evaluation.sessionState?.tableId || null,
+          sessionId: evaluation.sessionState?.id || null,
+          source: DIAG_SOURCE.STAFF,
+          payload: {
+            code: evaluation.code,
+            currentStatus: evaluation.currentStatus || null,
+            posConfirmed: !!evaluation.sessionState?.posConfirmed,
+          },
+        });
+        return res.status(evaluation.httpStatus || 409).json(buildApiErrorResponse(String(evaluation.code || 'CLOSURE_REJECTED').toUpperCase(), evaluation.message, {
           currentStatus: evaluation.currentStatus || null,
           posConfirmed: !!evaluation.sessionState?.posConfirmed,
-        });
+          requestId: req.requestId,
+        }));
       }
 
       try { delete carts[table]; } catch (e) {}
@@ -2377,10 +3011,19 @@ function mountStaffRoutes(prefix = '') {
       });
 
       if (!result?.ok) {
-        return res.status(409).json({
-          ok: false,
-          error: result?.error || 'close_failed',
-          message: result?.message || 'La clôture a échoué.',
+        await logEndpointError(req, {
+          eventCode: DIAG_EVENT.DB_ERROR,
+          eventType: 'close_table',
+          severity: DIAG_SEVERITY.ERROR,
+          message: result?.message || 'La cloture a echoue.',
+          tableCode: table,
+          tenantId: evaluation.sessionState?.tenantId || null,
+          tableId: evaluation.sessionState?.tableId || null,
+          sessionId: evaluation.sessionState?.id || null,
+          source: DIAG_SOURCE.STAFF,
+          payload: { result, closureType: evaluation.closureType },
+        });
+        return res.status(409).json(buildApiErrorResponse(String(result?.error || 'CLOSE_FAILED').toUpperCase(), result?.message || 'La cloture a echoue.', {
           storage: await detectTicketStorageMode(),
           journalStorage: await detectSessionEventsStorageMode(),
           closedAt,
@@ -2388,10 +3031,29 @@ function mountStaffRoutes(prefix = '') {
           posConfirmed: evaluation.posConfirmed,
           reason: evaluation.reason,
           note: evaluation.note,
-          result,
-        });
+          requestId: req.requestId,
+        }));
       }
 
+      await appendTenantEvent({
+        tenantId: evaluation.sessionState?.tenantId || null,
+        tableId: evaluation.sessionState?.tableId || null,
+        tableCode: table,
+        sessionId: evaluation.sessionState?.id || null,
+        eventType: 'close_table',
+        eventCode: evaluation.closureType === 'anomaly' ? DIAG_EVENT.SESSION_CLOSED_ANOMALY : DIAG_EVENT.SESSION_CLOSED_NORMAL,
+        severity: evaluation.closureType === 'anomaly' ? DIAG_SEVERITY.WARN : DIAG_SEVERITY.INFO,
+        message: evaluation.closureType === 'anomaly' ? 'Session cloturee avec anomalie.' : 'Session cloturee normalement.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
+        payload: {
+          closedAt,
+          closureType: evaluation.closureType,
+          posConfirmed: evaluation.posConfirmed,
+          reason: evaluation.reason,
+          note: evaluation.note,
+        },
+      });
       res.json({
         ok: true,
         storage: await detectTicketStorageMode(),
@@ -2402,10 +3064,18 @@ function mountStaffRoutes(prefix = '') {
         reason: evaluation.reason,
         note: evaluation.note,
         result,
+        requestId: req.requestId,
       });
     } catch (err) {
       console.error('POST /close-table error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'close_table',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/close-table` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de cloturer la table.', { requestId: req.requestId }));
     }
   });
 
@@ -2413,7 +3083,7 @@ function mountStaffRoutes(prefix = '') {
   app.post(prefix + '/cancel-close', async (req, res) => {
     try {
       const table = normalizeTableCode(req.body?.table || '');
-      if (!table) return res.json({ ok: true });
+      if (!table) return res.status(400).json(buildApiErrorResponse('MISSING_TABLE', 'Table manquante.', { requestId: req.requestId }));
 
       await appendSessionEvent('cancel_close_rejected', null, table, {
         createdAt: nowIso(),
@@ -2422,14 +3092,26 @@ function mountStaffRoutes(prefix = '') {
         note: 'Une session clôturée ne peut pas être réouverte automatiquement.',
       });
 
-      return res.status(409).json({
-        ok: false,
-        error: 'immutable_closure',
-        message: 'Une session clôturée ne peut pas être réouverte. Il faut ouvrir une nouvelle session.',
+      await appendTenantEvent({
+        tableCode: table,
+        eventType: 'cancel_close',
+        eventCode: DIAG_EVENT.CANCEL_CLOSE_REJECTED,
+        severity: DIAG_SEVERITY.WARN,
+        message: 'Reouverture automatique refusee : cloture immutable.',
+        source: DIAG_SOURCE.STAFF,
+        requestId: req.requestId,
       });
+      return res.status(409).json(buildApiErrorResponse('IMMUTABLE_CLOSURE', 'Une session cloturee ne peut pas etre reouverte. Il faut ouvrir une nouvelle session.', { requestId: req.requestId }));
     } catch (err) {
       console.error('POST /cancel-close error', err);
-      res.status(500).json({ ok: false, error: 'internal_error' });
+      await logEndpointError(req, {
+        eventCode: DIAG_EVENT.INTERNAL_ERROR,
+        eventType: 'cancel_close',
+        message: safeErrorMessage(err),
+        source: DIAG_SOURCE.STAFF,
+        payload: { endpoint: `${prefix}/cancel-close` },
+      });
+      res.status(500).json(buildApiErrorResponse('INTERNAL_ERROR', 'Impossible de traiter l annulation de cloture.', { requestId: req.requestId }));
     }
   });
 }

@@ -758,6 +758,7 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     source = 'api',
     staffId = null,
     metadata = null,
+    sessionState = null,
   } = options || {};
 
   const mode = await detectSessionStorageMode();
@@ -769,7 +770,9 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory' };
   }
 
-  const current = await getSessionStateForTable(table);
+  const current = (sessionState && sessionState.id)
+    ? sessionState
+    : await getSessionStateForTable(table);
   if (!current || !current.sessionStartAt || current.closedAt) {
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db' };
   }
@@ -785,7 +788,8 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
   const { error } = await supabase
     .from(SESSION_TABLE)
     .update(updatePayload)
-    .eq('id', current.id);
+    .eq('id', current.id)
+    .is('closed_at', null);
 
   if (error) {
     console.error(`[sessions] closeActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
@@ -2095,6 +2099,7 @@ function mountStaffRoutes(prefix = '') {
         reason: evaluation.reason,
         note: evaluation.note,
         source: 'staff_close_table',
+        sessionState: evaluation.sessionState,
         metadata: {
           currentStatus: evaluation.currentStatus,
           requestedClosureType: evaluation.closureType,

@@ -773,40 +773,50 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
   const current = (sessionState && sessionState.id)
     ? sessionState
     : await getSessionStateForTable(table);
-  if (!current || !current.sessionStartAt || current.closedAt) {
+  if (!current || (!current.sessionStartAt && !current.tableId) || current.closedAt) {
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'db' };
   }
+
+  const effectivePosConfirmed = closedWithAnomaly ? false : !!posConfirmed;
+  const effectivePosConfirmedAt = effectivePosConfirmed ? (current.posConfirmedAt || closedAt) : null;
 
   const updatePayload = {
     closed_at: closedAt,
     status: closedWithAnomaly ? STATUS.CLOSED_WITH_ANOMALY : STATUS.CLOSED,
     closed_with_anomaly: !!closedWithAnomaly,
-    pos_confirmed: !!posConfirmed,
-    pos_confirmed_at: posConfirmed ? (current.posConfirmedAt || closedAt) : null,
+    pos_confirmed: effectivePosConfirmed,
+    pos_confirmed_at: effectivePosConfirmedAt,
   };
 
-  const { error } = await supabase
+  let updateQuery = supabase
     .from(SESSION_TABLE)
     .update(updatePayload)
-    .eq('id', current.id)
     .is('closed_at', null);
+
+  if (current.tableId) {
+    updateQuery = updateQuery.eq('table_id', current.tableId);
+  } else if (current.id) {
+    updateQuery = updateQuery.eq('id', current.id);
+  }
+
+  const { error } = await updateQuery;
 
   if (error) {
     console.error(`[sessions] closeActiveSessionForTable fallback mémoire for ${table}:`, error.message || error);
     return { ok: true, sessionStartAt: null, closedManually: !!closedManually, mode: 'memory-fallback' };
   }
 
-  const sessionTotal = await syncSessionTotalInDb(current.id);
+  const sessionTotal = current.id ? await syncSessionTotalInDb(current.id) : null;
   await appendSessionEvent('session_closed', {
     ...current,
     status: updatePayload.status,
-    posConfirmed: !!updatePayload.pos_confirmed,
-    posConfirmedAt: updatePayload.pos_confirmed_at,
+    posConfirmed: !!effectivePosConfirmed,
+    posConfirmedAt: effectivePosConfirmedAt,
     closedWithAnomaly: !!updatePayload.closed_with_anomaly,
     sessionTotal: sessionTotal ?? current.sessionTotal ?? null,
   }, table, {
     createdAt: closedAt,
-    posConfirmed: !!updatePayload.pos_confirmed,
+    posConfirmed: !!effectivePosConfirmed,
     closedWithAnomaly: !!updatePayload.closed_with_anomaly,
     reason,
     note,
@@ -824,7 +834,7 @@ async function closeActiveSessionForTable(tableCode, options = {}) {
     mode: 'db',
     closedAt,
     closureType: closedWithAnomaly ? 'anomaly' : 'normal',
-    posConfirmed: !!updatePayload.pos_confirmed,
+    posConfirmed: !!effectivePosConfirmed,
     reason: reason || null,
   };
 }
@@ -1624,23 +1634,52 @@ async function tablesPayload() {
   const businessDay = getBusinessDayKey();
   const now = new Date();
   const tableIds = await getRestaurantTableCodesFromDb();
-  const activeSessionsMap = await getActiveSessionsMapFromDb();
+  const [activeSessionsMap, latestSessionsMap] = await Promise.all([
+    getActiveSessionsMapFromDb(),
+    getLatestSessionsMapFromDb(),
+  ]);
 
   const raw = await Promise.all(tableIds.map(async (id) => {
     const businessState = await getTableBusinessState(id, businessDay, now, activeSessionsMap);
     const activeSessionState = businessState.sessionState || { closedManually: false, sessionStartAt: null, closedAt: null };
+    const latestSessionState = latestSessionsMap.get(id) || null;
 
-    const hasActiveSession = !!(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
+    let status = businessState.status;
+    let pending = businessState.pending;
+    let lastTicketAt = businessState.lastTicketAt;
+    let lastTicket = businessState.lastTicketSummary;
+    let cleared = !!activeSessionState.closedManually;
+    let closedManually = !!activeSessionState.closedManually;
+    let sessionStartAt = activeSessionState.sessionStartAt || null;
+
+    const noActiveSession = !(activeSessionState && activeSessionState.sessionStartAt && !activeSessionState.closedAt);
+    const canShowLatestClosedState = (
+      noActiveSession &&
+      latestSessionState &&
+      latestSessionState.closedAt &&
+      isIsoInCurrentBusinessDay(latestSessionState.closedAt)
+    );
+
+    if (canShowLatestClosedState) {
+      status = STATUS.EMPTY;
+      pending = 0;
+      cleared = true;
+      closedManually = true;
+      sessionStartAt = null;
+      if (!lastTicketAt && latestSessionState.closedAt) {
+        lastTicketAt = latestSessionState.closedAt;
+      }
+    }
 
     return {
       id,
-      pending: hasActiveSession ? businessState.pending : 0,
-      status: hasActiveSession ? businessState.status : STATUS.EMPTY,
-      lastTicketAt: hasActiveSession ? businessState.lastTicketAt : null,
-      lastTicket: hasActiveSession ? businessState.lastTicketSummary : null,
-      cleared: !hasActiveSession,
-      closedManually: !hasActiveSession,
-      sessionStartAt: hasActiveSession ? (activeSessionState.sessionStartAt || null) : null,
+      pending,
+      status,
+      lastTicketAt,
+      lastTicket,
+      cleared,
+      closedManually,
+      sessionStartAt,
     };
   }));
 
@@ -1786,7 +1825,7 @@ async function evaluateTableClosureRequest(tableCode, body = {}) {
     ok: true,
     closureType: 'anomaly',
     closedWithAnomaly: true,
-    posConfirmed: posConfirmedFlag,
+    posConfirmed: false,
     reason: reason || 'MANUAL_ANOMALY',
     note: note || null,
     sessionState,
@@ -1803,7 +1842,9 @@ async function summaryPayload() {
     .map((group) => {
       const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
-      const businessStatus = computeSummarySessionStatus(orderedTickets, now);
+      let status = computeSummarySessionStatus(orderedTickets, now);
+      if (orderedTickets.some((t) => !!t.closedWithException)) status = 'Anomalie pas encodé';
+      else if (closedAt) status = 'Encodée en caisse';
       const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
       const closedAt = orderedTickets.reduce((latest, ticket) => {
         if (!ticket.closedAt) return latest;
@@ -1815,13 +1856,6 @@ async function summaryPayload() {
         if (!latest) return ticket.paidAt;
         return ticket.paidAt > latest ? ticket.paidAt : latest;
       }, null);
-      const closedWithException = orderedTickets.some((t) => !!t.closedWithException);
-      const posConfirmed = orderedTickets.some((t) => !!t.posConfirmed);
-
-      let status = businessStatus;
-      if (closedAt) {
-        status = closedWithException ? 'Anomalie pas encodé' : (posConfirmed ? 'Encodé dans la caisse' : 'Clôturée');
-      }
 
       return {
         id: group.id,

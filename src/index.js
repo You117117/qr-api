@@ -1868,80 +1868,266 @@ async function evaluateTableClosureRequest(tableCode, body = {}) {
   };
 }
 
-async function summaryPayload() {
-  const businessDay = getBusinessDayKey();
+function formatTimeLabel(isoValue) {
+  if (!isoValue) return '--:--';
+  const dt = new Date(isoValue);
+  if (Number.isNaN(dt.getTime())) return '--:--';
+  return dt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function computeDurationSeconds(startedAt, endedAt = null) {
+  if (!startedAt) return null;
+  const startTs = new Date(startedAt).getTime();
+  const endTs = endedAt ? new Date(endedAt).getTime() : Date.now();
+  if (Number.isNaN(startTs) || Number.isNaN(endTs) || endTs < startTs) return null;
+  return Math.round((endTs - startTs) / 1000);
+}
+
+function mapHistoryDisplayStatus({ sessionRow, orderedTickets, now = new Date() }) {
+  const closedAt = sessionRow?.closedAt || null;
+  const closedWithAnomaly = !!sessionRow?.closedWithAnomaly;
+
+  if (closedAt) {
+    return {
+      stateKind: closedWithAnomaly ? 'closed_anomaly' : 'closed_normal',
+      status: closedWithAnomaly ? 'Anomalie pas encodé' : 'Encodée en caisse',
+      closureType: closedWithAnomaly ? 'anomaly' : 'normal',
+    };
+  }
+
+  const activeStatus = computeSummarySessionStatus(orderedTickets, now);
+  return {
+    stateKind: 'active',
+    status: activeStatus,
+    closureType: 'active',
+  };
+}
+
+function buildHistoryItem({ sessionRow, orderedTickets, tableMeta, now = new Date() }) {
+  const tickets = Array.isArray(orderedTickets)
+    ? [...orderedTickets].sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
+    : [];
+
+  const startedAt = sessionRow?.sessionStartAt || sessionRow?.openedAt || (tickets[0]?.sessionStartedAt || tickets[0]?.createdAt || null);
+  const closedAt = sessionRow?.closedAt || tickets.reduce((latest, ticket) => {
+    if (!ticket.closedAt) return latest;
+    if (!latest) return ticket.closedAt;
+    return ticket.closedAt > latest ? ticket.closedAt : latest;
+  }, null);
+  const paidAt = sessionRow?.posConfirmedAt || tickets.reduce((latest, ticket) => {
+    if (!ticket.paidAt) return latest;
+    if (!latest) return ticket.paidAt;
+    return ticket.paidAt > latest ? ticket.paidAt : latest;
+  }, null);
+  const sessionTotal = typeof sessionRow?.sessionTotal === 'number'
+    ? sessionRow.sessionTotal
+    : tickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
+  const total = Math.round((Number(sessionTotal || 0) + Number.EPSILON) * 100) / 100;
+  const durationSeconds = computeDurationSeconds(startedAt, closedAt || null);
+  const itemsCount = tickets.reduce((sum, ticket) => {
+    const list = Array.isArray(ticket.items) ? ticket.items : [];
+    return sum + list.reduce((acc, item) => acc + Number(item.qty || item.quantity || 0), 0);
+  }, 0);
+  const display = mapHistoryDisplayStatus({ sessionRow, orderedTickets: tickets, now });
+
+  return {
+    id: sessionRow?.id || `${tableMeta?.code || sessionRow?.tableCode || 'TABLE'}__${startedAt || tickets[0]?.createdAt || nowIso()}`,
+    sessionId: sessionRow?.id || null,
+    tenantId: sessionRow?.tenantId || tableMeta?.tenant_id || null,
+    tableId: sessionRow?.tableId || tableMeta?.id || null,
+    table: tableMeta?.code || sessionRow?.tableCode || null,
+    tableLabel: tableMeta?.label || tableMeta?.code || sessionRow?.tableCode || null,
+    sessionKey: startedAt || sessionRow?.sessionStartAt || null,
+    sessionStartedAt: startedAt,
+    openedAt: startedAt,
+    closedAt: closedAt || null,
+    paidAt: paidAt || null,
+    updatedAt: closedAt || paidAt || tickets[tickets.length - 1]?.createdAt || startedAt || null,
+    createdAt: startedAt || tickets[0]?.createdAt || null,
+    durationSeconds,
+    total,
+    ordersCount: tickets.length,
+    itemsCount,
+    hasOrders: tickets.length > 0,
+    stateKind: display.stateKind,
+    status: display.status,
+    displayStatus: display.status,
+    closureType: display.closureType,
+    cashRegisterConfirmed: !!sessionRow?.posConfirmed,
+    posConfirmed: !!sessionRow?.posConfirmed,
+    posConfirmedAt: sessionRow?.posConfirmedAt || null,
+    closedWithAnomaly: !!sessionRow?.closedWithAnomaly,
+    time: formatTimeLabel(startedAt),
+    openedTime: formatTimeLabel(startedAt),
+    closedTime: closedAt ? formatTimeLabel(closedAt) : '--:--',
+    tickets: tickets.map((t) => ({
+      id: t.id,
+      table: t.table,
+      total: t.total,
+      items: t.items,
+      clientName: t.clientName || null,
+      time: formatTimeLabel(t.createdAt),
+      createdAt: t.createdAt,
+      printedAt: t.printedAt || null,
+      paidAt: t.paidAt || null,
+      closedAt: t.closedAt || null,
+      paid: !!t.paid,
+      posConfirmed: typeof t.posConfirmed === 'boolean' ? t.posConfirmed : null,
+      closedWithException: !!t.closedWithException,
+      exceptionReason: t.exceptionReason || null,
+      sessionKey: t.sessionKey || startedAt,
+      sessionStartedAt: t.sessionStartedAt || startedAt,
+    })),
+  };
+}
+
+async function buildHistoricalSessions({
+  businessDay = getBusinessDayKey(),
+  tableCode = null,
+  closureType = 'all',
+  includeActive = true,
+  limit = null,
+  offset = 0,
+} = {}) {
+  const normalizedTable = normalizeTableCode(tableCode);
+  const requestedClosureType = String(closureType || 'all').trim().toLowerCase();
   const now = new Date();
+  const tables = await getRestaurantTablesFromDb();
+  const tableById = new Map((tables || []).map((row) => [row.id, row]));
+  const tableByCode = new Map((tables || []).map((row) => [normalizeTableCode(row.code), row]));
+  const { startIso, endIso } = getBusinessDayRange(businessDay);
 
-  const list = (await groupTicketsBySessionForDay(businessDay))
-    .map((group) => {
-      const orderedTickets = [...group.tickets].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-      const lastTicket = orderedTickets[orderedTickets.length - 1] || null;
-      const status = computeSummarySessionStatus(orderedTickets, now);
-      const total = orderedTickets.reduce((sum, ticket) => sum + Number(ticket.total || 0), 0);
-      const closedAt = orderedTickets.reduce((latest, ticket) => {
-        if (!ticket.closedAt) return latest;
-        if (!latest) return ticket.closedAt;
-        return ticket.closedAt > latest ? ticket.closedAt : latest;
-      }, null);
-      const paidAt = orderedTickets.reduce((latest, ticket) => {
-        if (!ticket.paidAt) return latest;
-        if (!latest) return ticket.paidAt;
-        return ticket.paidAt > latest ? ticket.paidAt : latest;
-      }, null);
+  let sessionRows = [];
+  if ((await detectSessionStorageMode()) === 'db') {
+    let query = supabase
+      .from(SESSION_TABLE)
+      .select('*')
+      .gte(SESSION_STARTED_AT_COLUMN, startIso)
+      .lt(SESSION_STARTED_AT_COLUMN, endIso)
+      .order(SESSION_STARTED_AT_COLUMN, { ascending: false });
 
-      const summaryStatus = closedAt
-        ? (orderedTickets.some((t) => !!t.closedWithException) ? 'Anomalie pas encodé' : 'Encodée en caisse')
-        : status;
+    if (normalizedTable) {
+      const tableMeta = tableByCode.get(normalizedTable);
+      if (tableMeta?.id) {
+        query = query.eq('table_id', tableMeta.id);
+      } else {
+        query = query.eq('table_code', normalizedTable);
+      }
+    }
 
+    const { data, error } = await query;
+    if (error) throw error;
+    sessionRows = Array.isArray(data) ? data.map((row) => {
+      const tableMeta = tableById.get(row.table_id) || tableByCode.get(normalizeTableCode(row.table_code));
       return {
-        id: group.id,
-        table: group.table,
-        sessionKey: group.sessionKey,
-        sessionStartedAt: group.sessionStartedAt,
-        total,
-        status: summaryStatus,
-        time: new Date(group.createdAt).toLocaleTimeString('fr-FR', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-        createdAt: group.createdAt,
-        updatedAt: group.updatedAt,
-        closedAt: closedAt || null,
-        paidAt: paidAt || null,
-        isClosed: !!closedAt,
-        closureType: orderedTickets.some((t) => !!t.closedWithException) ? 'anomaly' : (closedAt ? 'normal' : null),
-        tickets: orderedTickets.map((t) => ({
-          id: t.id,
-          table: t.table,
-          total: t.total,
-          items: t.items,
-          clientName: t.clientName || null,
-          time: new Date(t.createdAt).toLocaleTimeString('fr-FR', {
-            hour: '2-digit',
-            minute: '2-digit',
-          }),
-          createdAt: t.createdAt,
-          printedAt: t.printedAt || null,
-          paidAt: t.paidAt || null,
-          closedAt: t.closedAt || null,
-          paid: !!t.paid,
-          posConfirmed: typeof t.posConfirmed === 'boolean' ? t.posConfirmed : null,
-          closedWithException: !!t.closedWithException,
-          exceptionReason: t.exceptionReason || null,
-          sessionKey: t.sessionKey || group.sessionKey,
-          sessionStartedAt: t.sessionStartedAt || group.sessionStartedAt,
-        })),
-        lastTicketId: lastTicket ? lastTicket.id : null,
+        raw: row,
+        mapped: mapSessionRowToState(row, tableMeta?.code || row.table_code || null),
+        tableMeta: tableMeta || null,
       };
+    }) : [];
+  }
+
+  const allTickets = await listTicketsForBusinessDayFromDb(businessDay);
+  const ticketsByGroupKey = new Map();
+  (Array.isArray(allTickets) ? allTickets : []).forEach((ticket) => {
+    const ticketTable = normalizeTableCode(ticket.table);
+    if (normalizedTable && ticketTable !== normalizedTable) return;
+    const sessionKey = ticket.sessionKey || ticket.sessionStartedAt || ticket.createdAt || `${ticketTable}-${ticket.id}`;
+    const groupKey = `${ticketTable}__${sessionKey}`;
+    if (!ticketsByGroupKey.has(groupKey)) ticketsByGroupKey.set(groupKey, []);
+    ticketsByGroupKey.get(groupKey).push(ticket);
+  });
+
+  const items = sessionRows
+    .map(({ mapped, tableMeta }) => {
+      const tableCodeSafe = normalizeTableCode(mapped.tableCode || tableMeta?.code);
+      const sessionKey = mapped.sessionStartAt || mapped.closedAt || null;
+      const groupKey = `${tableCodeSafe}__${sessionKey}`;
+      const orderedTickets = ticketsByGroupKey.get(groupKey) || [];
+      return buildHistoryItem({ sessionRow: mapped, orderedTickets, tableMeta, now });
+    })
+    .filter((item) => {
+      if (!includeActive && item.stateKind === 'active') return false;
+      if (requestedClosureType === 'all') return true;
+      if (requestedClosureType === 'normal') return item.closureType === 'normal';
+      if (requestedClosureType === 'anomaly') return item.closureType === 'anomaly';
+      if (requestedClosureType === 'active') return item.stateKind === 'active';
+      return true;
+    })
+    .filter((item) => {
+      if (normalizedTable && normalizeTableCode(item.table) !== normalizedTable) return false;
+      if (item.stateKind === 'active') return true;
+      return item.hasOrders;
     })
     .sort((a, b) => {
-      const aTs = new Date(a.updatedAt || a.createdAt).getTime();
-      const bTs = new Date(b.updatedAt || b.createdAt).getTime();
+      const aTs = new Date(a.closedAt || a.openedAt || a.createdAt || 0).getTime();
+      const bTs = new Date(b.closedAt || b.openedAt || b.createdAt || 0).getTime();
       if (!Number.isNaN(aTs) && !Number.isNaN(bTs)) return bTs - aTs;
-      return String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || ''));
+      return String(b.closedAt || b.openedAt || b.createdAt || '').localeCompare(String(a.closedAt || a.openedAt || a.createdAt || ''));
     });
 
-  return { tickets: list };
+  const safeOffset = Math.max(0, Number(offset || 0) || 0);
+  const safeLimit = limit == null ? null : Math.max(0, Number(limit || 0) || 0);
+  const paged = safeLimit ? items.slice(safeOffset, safeOffset + safeLimit) : items.slice(safeOffset);
+
+  return {
+    businessDay,
+    items: paged,
+    meta: {
+      count: paged.length,
+      totalCount: items.length,
+      offset: safeOffset,
+      limit: safeLimit,
+    },
+  };
+}
+
+function computeSummaryTotals(items = []) {
+  const totals = {
+    sessionsCount: items.length,
+    activeCount: 0,
+    closedNormalCount: 0,
+    closedAnomalyCount: 0,
+    grossTotal: 0,
+    averageBasket: 0,
+    averageDurationSeconds: 0,
+  };
+
+  let durationCount = 0;
+  items.forEach((item) => {
+    if (item.stateKind === 'active') totals.activeCount += 1;
+    if (item.closureType === 'normal') totals.closedNormalCount += 1;
+    if (item.closureType === 'anomaly') totals.closedAnomalyCount += 1;
+    totals.grossTotal += Number(item.total || 0);
+    if (typeof item.durationSeconds === 'number') {
+      totals.averageDurationSeconds += item.durationSeconds;
+      durationCount += 1;
+    }
+  });
+
+  totals.grossTotal = Math.round((totals.grossTotal + Number.EPSILON) * 100) / 100;
+  totals.averageBasket = items.length ? Math.round(((totals.grossTotal / items.length) + Number.EPSILON) * 100) / 100 : 0;
+  totals.averageDurationSeconds = durationCount ? Math.round(totals.averageDurationSeconds / durationCount) : 0;
+
+  return totals;
+}
+
+async function summaryPayload() {
+  const businessDay = getBusinessDayKey();
+  const history = await buildHistoricalSessions({
+    businessDay,
+    closureType: 'all',
+    includeActive: true,
+  });
+
+  return {
+    ok: true,
+    date: businessDay,
+    totals: computeSummaryTotals(history.items),
+    items: history.items,
+    tickets: history.items,
+    meta: history.meta,
+  };
 }
 // ---- Montage des routes Staff (root + /staff pour compatibilité) ----
 
@@ -1962,6 +2148,41 @@ function mountStaffRoutes(prefix = '') {
       res.json(await summaryPayload());
     } catch (err) {
       console.error('GET /summary error', err);
+      res.status(500).json({ ok: false, error: 'internal_error' });
+    }
+  });
+
+  // GET history-sessions
+  app.get(prefix + '/history-sessions', async (req, res) => {
+    try {
+      const businessDay = String(req.query?.date || getBusinessDayKey()).trim() || getBusinessDayKey();
+      const tableCode = String(req.query?.tableId || req.query?.table || '').trim() || null;
+      const closureType = String(req.query?.closureType || 'all').trim().toLowerCase() || 'all';
+      const includeActive = String(req.query?.includeActive || '').trim().toLowerCase() === 'true' || closureType === 'active';
+      const limitRaw = req.query?.limit;
+      const offsetRaw = req.query?.offset;
+      const history = await buildHistoricalSessions({
+        businessDay,
+        tableCode,
+        closureType,
+        includeActive,
+        limit: limitRaw == null ? null : Number(limitRaw),
+        offset: offsetRaw == null ? 0 : Number(offsetRaw),
+      });
+
+      res.json({
+        ok: true,
+        date: history.businessDay,
+        filters: {
+          tableId: tableCode,
+          closureType,
+          includeActive,
+        },
+        items: history.items,
+        meta: history.meta,
+      });
+    } catch (err) {
+      console.error('GET /history-sessions error', err);
       res.status(500).json({ ok: false, error: 'internal_error' });
     }
   });
